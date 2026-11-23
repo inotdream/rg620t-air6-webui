@@ -18,6 +18,8 @@ import { getSession, ubus } from '@/services/deviceUbus';
 import { useSmsEvents } from '@/modules/cellular/stream';
 import { decodeDeliver, mergeParts, readableTime, type InboxMessage } from '@/modules/sms/decode';
 import { TAG_COLOR } from '@/ui/tokens';
+import SmsServices from '@/modules/cellular/SmsServices';
+import { useSdkAccess } from '@/modules/cellular/sdk';
 
 const { Sider, Content } = Layout;
 
@@ -61,6 +63,7 @@ const avatarLabel = (num: string) => {
 };
 
 const Sms: React.FC = () => {
+  const sdkAccess = useSdkAccess();
   const [inbox, setInbox] = useState<Inbox | null>(null);
   const [messages, setMessages] = useState<InboxMessage[]>([]);
   const [unreadable, setUnreadable] = useState(0);
@@ -284,6 +287,7 @@ const Sms: React.FC = () => {
           )}
         </div>
         <div className="sms-toolbar-actions">
+          {sdkAccess?.sdk ? <SmsServices disabled={deleting} /> : null}
           <Button size="small" icon={<IconRefresh />} loading={refreshing} disabled={deleting} onClick={() => load()}>
             刷新
           </Button>

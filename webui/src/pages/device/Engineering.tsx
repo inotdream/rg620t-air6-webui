@@ -268,8 +268,12 @@ const Engineering: React.FC = () => {
       </div>
 
       <PageCard title="设备温度" bodyClassName="engineering-temperatures">
-        {!!modemTemps.length && <Panel title="基带温度">
-          <Kv dense columns={3} items={modemTemps.map(({sensor,celsius})=>({label:sensor,value:`${celsius.toFixed(1)} °C`}))}/>
+        {!!modemTemps.length && <Panel title="基带温度"
+          extra={modemTemps.some(t=>(t.cooling ?? 0) > 0) ? <Tag size="small" color={TAG_COLOR.warning}>已触发降频</Tag> : '未降频'}>
+          <Kv dense columns={3} items={modemTemps.map(({sensor,celsius,cooling})=>({
+            label:sensor,
+            value:`${celsius.toFixed(1)} °C${cooling ? ` · 降频 L${cooling}` : ''}`,
+          }))}/>
         </Panel>}
         {!!info?.thermal?.length && <Panel title="系统温度">
           <Kv dense items={info.thermal.map(({sensor,milli_c})=>({label:sensor,value:temperature(milli_c)}))}/>

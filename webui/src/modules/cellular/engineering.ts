@@ -27,15 +27,17 @@ export type ScanReply = {
 export type AtResult = { ok?: boolean; incomplete?:boolean; modem_ok?: boolean; command?: string; reply?: string; error?: string };
 
 // QTEMP reports Celsius, not millidegrees. Empty slots and the -128 sentinel have no reading.
+// The third field is the thermal mitigation level of that zone; 0 means not throttled.
 export function modemTemperatures(reply: string) {
-  const readings = new Map<string, number>();
+  const readings = new Map<string, { celsius: number; cooling: number | null }>();
   for (const line of reply.split(/\r?\n/)) {
-    const match = /^\+QTEMP:\s*"([^"]*)"\s*,\s*"(-?\d+(?:\.\d+)?)"\s*,\s*"[^"]*"\s*$/.exec(line.trim());
+    const match = /^\+QTEMP:\s*"([^"]*)"\s*,\s*"(-?\d+(?:\.\d+)?)"\s*,\s*"([^"]*)"\s*$/.exec(line.trim());
     if (!match) continue;
     const sensor = match[1].trim(), celsius = Number(match[2]);
-    if (sensor && Number.isFinite(celsius) && celsius !== -128) readings.set(sensor, celsius);
+    const cooling = /^\d{1,2}$/.test(match[3].trim()) ? Number(match[3]) : null;
+    if (sensor && Number.isFinite(celsius) && celsius !== -128) readings.set(sensor, { celsius, cooling });
   }
-  return Array.from(readings, ([sensor, celsius]) => ({sensor, celsius}));
+  return Array.from(readings, ([sensor, value]) => ({ sensor, ...value }));
 }
 
 export const scanActive = (state?: string) => ['queued', 'running', 'stopping'].includes(state || '');
@@ -76,6 +78,21 @@ const errors: Record<string, string> = {
   scan_call: '有通话或来电，请在通话结束后扫描。',
   scan_start: '无法启动扫描任务。',
   scan_stop: '设备未接受停止请求。',
+  confirm: '请求缺少确认，未执行。',
+  ril_init: '无法连接基带接口。',
+  nw_read: '基带未返回网络信息。',
+  plmn_write: '基带拒绝了选网请求。',
+  plmn_rejected: '所选网络拒绝注册。可以恢复自动选网。',
+  smsc_read: '未能读取短信中心号码。',
+  smsc_changed: '短信中心号码已在别处修改，请刷新后再改。',
+  smsc_write: '基带拒绝修改短信中心号码。',
+  ussd_send: '基带未接受这次 USSD 请求。',
+  ussd_timeout: '运营商 15 秒内没有回复。VoLTE 下部分运营商不支持 USSD。',
+  apn_unsupported: '未找到蜂窝拨号接口（network.wan，ql_datacall）。',
+  apn_changed: 'APN 已在别处修改，请刷新后再改。',
+  apn_write: '保存 APN 失败。',
+  ss_rejected: '运营商拒绝了这项补充业务，可能未开通，或需通过运营商客服设置。',
+  ss_unavailable: '基带没有可用的补充业务通道：当前没有 CS 注册，VoLTE/VoNR 下需要运营商的 XCAP（Ut）服务，此卡或网络未提供。可改用运营商客服或短信办理。',
 };
 export function engineeringError(error: unknown) {
   const key = error instanceof Error ? error.message : typeof error === 'string' ? error : '';

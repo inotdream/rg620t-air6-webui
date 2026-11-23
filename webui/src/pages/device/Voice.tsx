@@ -5,6 +5,8 @@ import { Metric, PageCard, TwoCol } from '@/ui/widgets';
 import { TAG_COLOR } from '@/ui/tokens';
 import { ubus } from '@/services/deviceUbus';
 import WebAudio from '@/modules/webvoice/WebAudio';
+import CallServices from '@/modules/cellular/CallServices';
+import { useSdkAccess } from '@/modules/cellular/sdk';
 
 type Call = { id: number; direction: number; state: number; kind: number; number: string; voice?: boolean };
 type VoiceStatus = { ok?: boolean; browser_audio?: boolean; read_only?: boolean; calls?: Call[]; error?: string };
@@ -47,6 +49,7 @@ const ERRORS: Record<string, string> = {
 const pickError = (error?: string) => (error ? ERRORS[error] || error : '操作失败');
 
 const Voice: React.FC = () => {
+  const access = useSdkAccess();
   const [status, setStatus] = useState<VoiceStatus | null>(null);
   const [checks, setChecks] = useState<Checks>({});
   const [number, setNumber] = useState('');
@@ -334,6 +337,8 @@ const Voice: React.FC = () => {
           </div>
         </PageCard>
       </TwoCol>
+
+      {access?.services ? <CallServices disabled={!idle} /> : null}
 
       <div className="callout-note">
         呼叫指令映射：拨号 ATD、接听 ATA、挂断 AT+CHUP、按键 MIPC 单键 DTMF、状态轮询 AT+CLCC。与 LuCI 蜂窝页共用底层锁，多端并发操作会自动排队。

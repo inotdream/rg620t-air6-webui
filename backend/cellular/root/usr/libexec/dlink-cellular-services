@@ -1,0 +1,196 @@
+#!/bin/sh
+# Supplementary services over the modem AT channel and the cellular APN in UCI.
+# One JSON request on stdin; credentials never enter argv or the environment.
+
+error() { printf '{"ok":false,"error":"%s"}\n' "$1"; }
+. /usr/share/libubox/jshn.sh
+
+input="$(head -c 1025)"
+[ "${#input}" -le 1024 ] || { error input; exit 0; }
+case "$input" in *'\u0000'*) error input; exit 0;; esac
+[ -n "$input" ] || input='{}'
+json_load "$input" || { error input; exit 0; }
+
+confirmed() {
+	local value type
+	json_get_type type confirm
+	json_get_var value confirm
+	[ "$type:$value" = boolean:1 ]
+}
+
+# Network-side services can take several seconds; two of these must fit the rpcd budget.
+at() {
+	exec 9>/var/lock/dlink-cellular.lock || return 2
+	flock -w 2 9 || { exec 9>&-; return 3; }
+	reply="$(timeout 9 /usr/bin/mipc_wan_cli --at_cmd "$1" 2>/dev/null | tr -d '\r')"
+	exec 9>&-
+	[ -n "$reply" ] || return 1
+	[ "$(printf '%s\n' "$reply" | awk 'NF {last=$0} END {print last}')" = OK ]
+}
+# CME 30 means the modem has no domain to carry the request: no CS registration and no Ut/XCAP over IMS.
+at_error() {
+	case "$1" in
+		3) error busy;;
+		1) if printf '%s\n' "$reply" | grep -q '+CME ERROR: 30'; then error ss_unavailable
+		   elif printf '%s\n' "$reply" | grep -q 'ERROR'; then error ss_rejected
+		   else error at_no_response; fi;;
+		*) error at_unavailable;;
+	esac
+}
+int_field() {
+	local type value
+	json_get_type type "$1"
+	json_get_var value "$1"
+	[ "$type" = int ] || return 1
+	printf '%s' "$value"
+}
+
+# +CCFC: <status>,<class>[,"<number>",<type>[,<subaddr>,<satype>[,<time>]]]
+# Only voice (class bit 1) matters to this page; data and fax classes are ignored.
+cf_report() {
+	printf '%s\n' "$reply" | awk -v reason="$1" '
+		/^\+CCFC:/ {
+			sub(/^\+CCFC:[ ]*/, "")
+			n = split($0, f, ",")
+			class = f[2] + 0
+			if (f[1] == 1 && (class == 0 || class % 2 == 1)) {
+				on = 1
+				number = f[3]; gsub(/"/, "", number)
+				time = (n >= 7 && f[7] ~ /^[0-9]+$/) ? f[7] : ""
+			}
+		}
+		END {
+			if (number !~ /^\+?[0-9]{1,24}$/) number = ""
+			printf "{\"ok\":true,\"reason\":%d,\"enabled\":%s,\"number\":%s,\"time\":%s}\n", reason,
+				on ? "true" : "false", number == "" ? "null" : "\"" number "\"", time == "" ? "null" : time
+		}'
+}
+cw_report() {
+	printf '%s\n' "$reply" | awk '
+		/^\+CCWA:/ {
+			sub(/^\+CCWA:[ ]*/, "")
+			split($0, f, ",")
+			class = f[2] + 0
+			if (f[1] == 1 && (class == 0 || class % 2 == 1)) on = 1
+		}
+		END { printf "{\"ok\":true,\"enabled\":%s}\n", on ? "true" : "false" }'
+}
+valid_number() {
+	case "$1" in ''|*[!0-9+]*|?*+*) return 1;; esac
+	digits="${1#+}"
+	[ "${#digits}" -ge 3 ] && [ "${#digits}" -le 20 ]
+}
+
+apn_read() {
+	[ "$(uci -q get network.wan)" = interface ] && [ "$(uci -q get network.wan.proto)" = ql_datacall ] || return 1
+	apn="$(uci -q get network.wan.apn)"
+	user="$(uci -q get network.wan.username)"
+	pass="$(uci -q get network.wan.password)"
+	auth="$(uci -q get network.wan.auth)"; auth="${auth:-0}"
+	iptype="$(uci -q get network.wan.iptype)"; iptype="${iptype:-3}"
+	case "$auth:$iptype" in [0-3]:[1-3]) ;; *) return 1;; esac
+	revision="$(printf '%s\n%s\n%s\n%s\n%s\n' "$apn" "$user" "$pass" "$auth" "$iptype" | md5sum | cut -c1-16)"
+}
+valid_apn() {
+	[ -z "$1" ] && return 0
+	[ "${#1}" -le 63 ] || return 1
+	case "$1" in [!A-Za-z0-9]*|*[!A-Za-z0-9.-]*) return 1;; esac
+}
+# Printable ASCII without spaces, quotes or backslashes; the proto script passes these to ql_api.
+valid_secret() {
+	[ "${#1}" -le 64 ] || return 1
+	case "$1" in *[!!-~]*|*\"*|*\'*|*\\*|*\`*) return 1;; esac
+}
+
+case "$1" in
+	cf_query)
+		reason="$(int_field reason)" || { error input; exit 0; }
+		case "$reason" in [0-3]) ;; *) error input; exit 0;; esac
+		at "AT+CCFC=$reason,2"; rc=$?
+		[ "$rc" -eq 0 ] || { at_error "$rc"; exit 0; }
+		cf_report "$reason";;
+	cf_set)
+		confirmed || { error confirm; exit 0; }
+		reason="$(int_field reason)" || { error input; exit 0; }
+		case "$reason" in [0-3]) ;; *) error input; exit 0;; esac
+		json_get_type et enabled; json_get_var enabled enabled
+		[ "$et" = boolean ] || { error input; exit 0; }
+		if [ "$enabled" = 1 ]; then
+			json_get_type nt number; json_get_var number number
+			[ "$nt" = string ] && valid_number "$number" || { error input; exit 0; }
+			type=129; case "$number" in +*) type=145;; esac
+			cmd="AT+CCFC=$reason,3,\"$number\",$type"
+			if [ "$reason" = 2 ]; then
+				time="$(int_field time)" || time=20
+				case "$time" in 5|10|15|20|25|30) ;; *) error input; exit 0;; esac
+				cmd="$cmd,,,$time"
+			fi
+		else
+			cmd="AT+CCFC=$reason,0"
+		fi
+		at "$cmd"; rc=$?
+		[ "$rc" -eq 0 ] || { at_error "$rc"; exit 0; }
+		at "AT+CCFC=$reason,2"; rc=$?
+		[ "$rc" -eq 0 ] || { error readback; exit 0; }
+		result="$(cf_report "$reason")"
+		case "$result" in *"\"enabled\":$([ "$enabled" = 1 ] && echo true || echo false)"*) printf '%s\n' "$result";; *) error readback;; esac;;
+	cw_query)
+		at 'AT+CCWA=0,2'; rc=$?
+		[ "$rc" -eq 0 ] || { at_error "$rc"; exit 0; }
+		cw_report;;
+	cw_set)
+		confirmed || { error confirm; exit 0; }
+		json_get_type et enabled; json_get_var enabled enabled
+		[ "$et" = boolean ] || { error input; exit 0; }
+		at "AT+CCWA=0,$enabled,1"; rc=$?
+		[ "$rc" -eq 0 ] || { at_error "$rc"; exit 0; }
+		at 'AT+CCWA=0,2'; rc=$?
+		[ "$rc" -eq 0 ] || { error readback; exit 0; }
+		result="$(cw_report)"
+		case "$result" in *"\"enabled\":$([ "$enabled" = 1 ] && echo true || echo false)"*) printf '%s\n' "$result";; *) error readback;; esac;;
+	apn_get)
+		apn_read || { error apn_unsupported; exit 0; }
+		json_init
+		json_add_boolean ok 1
+		json_add_string apn "$apn"
+		json_add_string username "$user"
+		json_add_boolean password_set "$([ -n "$pass" ] && echo 1 || echo 0)"
+		json_add_int auth "$auth"
+		json_add_int iptype "$iptype"
+		json_add_string revision "$revision"
+		json_dump;;
+	apn_set)
+		confirmed || { error confirm; exit 0; }
+		for key in apn username revision; do
+			json_get_type t "$key"; [ "$t" = string ] || { error input; exit 0; }
+		done
+		json_get_var apn_new apn; json_get_var user_new username; json_get_var revision_old revision
+		auth_new="$(int_field auth)" && iptype_new="$(int_field iptype)" || { error input; exit 0; }
+		case "$auth_new:$iptype_new" in [0-3]:[1-3]) ;; *) error input; exit 0;; esac
+		valid_apn "$apn_new" && valid_secret "$user_new" || { error input; exit 0; }
+		keep=1
+		if json_get_type pt password; then
+			[ "$pt" = string ] || { error input; exit 0; }
+			json_get_var pass_new password
+			valid_secret "$pass_new" || { error input; exit 0; }
+			keep=0
+		fi
+		exec 8>/var/lock/dlink-wan-auto.lock || { error busy; exit 0; }; flock -n 8 || { error busy; exit 0; }
+		[ -z "$(uci -q changes network)" ] || { error network_pending; exit 0; }
+		apn_read || { error apn_unsupported; exit 0; }
+		[ "$revision" = "$revision_old" ] || { error apn_changed; exit 0; }
+		[ "$keep" = 1 ] && pass_new="$pass"
+		tmp="$(mktemp -d /tmp/dlink-apn.XXXXXX)" || { error apn_write; exit 0; }; trap 'rm -rf "$tmp"' EXIT
+		for pair in "apn:$apn_new" "username:$user_new" "password:$pass_new"; do
+			key="${pair%%:*}" value="${pair#*:}"
+			if [ -n "$value" ]; then uci -q -t "$tmp" set "network.wan.$key=$value"
+			else uci -q -t "$tmp" delete "network.wan.$key" || [ -z "$(uci -q get "network.wan.$key")" ]; fi ||
+				{ error apn_write; exit 0; }
+		done
+		uci -q -t "$tmp" set "network.wan.auth=$auth_new" && uci -q -t "$tmp" set "network.wan.iptype=$iptype_new" &&
+			uci -q -t "$tmp" commit network || { error apn_write; exit 0; }
+		apn_read && [ "$apn:$user:$pass:$auth:$iptype" = "$apn_new:$user_new:$pass_new:$auth_new:$iptype_new" ] ||
+			{ error readback; exit 0; }
+		printf '{"ok":true,"applied":false,"revision":"%s"}\n' "$revision";;
+	*) error input;;
+esac

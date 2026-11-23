@@ -34,7 +34,15 @@
           "events_sms",
           "beam_info",
           "radio_policy",
-          "sim_protection"
+          "sim_protection",
+          "sdk_identity",
+          "sdk_network",
+          "sdk_radio",
+          "plmn_scan_status",
+          "smsc_get",
+          "apn_get",
+          "cf_query",
+          "cw_query"
         ]
       }
     },
@@ -58,7 +66,16 @@
           "radio_policy_set",
           "sim_action",
           "wifi_flag_set",
-          "wan_auto_set"
+          "wan_auto_set",
+          "airplane_set",
+          "nwmode_set",
+          "plmn_set",
+          "plmn_scan_start",
+          "smsc_set",
+          "ussd_send",
+          "apn_set",
+          "cf_set",
+          "cw_set"
         ]
       }
     }

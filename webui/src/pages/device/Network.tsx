@@ -20,6 +20,9 @@ import { describeCarriers, hasDataService, lockMatch, servingCarriers, servingTa
 import { rsrpPercent, rsrqTone, scoreLabel, scoreTone, sinrTone } from '@/modules/cellular/grade';
 import { useCellularStream } from '@/modules/cellular/stream';
 import LockCellModal from '@/modules/cellular/LockCellModal';
+import {
+  nitzLabel, operatorLabel, RAT_NAMES, REG_STATES, tddLabel, useSdkAccess, type NetworkExtra,
+} from '@/modules/cellular/sdk';
 
 type SessionQos = { ok?: boolean; error?: string; kind?: '5QI' | 'QCI' | ''; sessions?: Array<{
   cid: number; apn: string; role: 'ims' | 'data'; classes: number[];
@@ -78,6 +81,12 @@ const Network: React.FC = () => {
   const qosReading = useRef(false);
   const lastQosAt = useRef(0);
   const ratRef = useRef('');
+  const access = useSdkAccess();
+  const [extra, setExtra] = useState<NetworkExtra | null>(null);
+  const extraReading = useRef(false);
+  const lastExtraAt = useRef(0);
+  const sdkReady = useRef(false);
+  sdkReady.current = access?.sdk === true;
   const [pageVisible, setPageVisible] = useState(() => !document.hidden);
   const { snapshot, status: liveStatus } = useCellularStream(auto.enabled && pageVisible);
   const lastSample = useRef<{ rx: number; tx: number; at: number; name: string } | null>(null);
@@ -163,10 +172,26 @@ const Network: React.FC = () => {
     }
   }, []);
 
+  // 运营商名、授时、TDD 帧结构几乎不变，一分钟读一次，排在 QoS 之后避免与其他查询抢基带锁。
+  const readExtra = useCallback(async (force = false) => {
+    if (!sdkReady.current || extraReading.current) return;
+    if (!force && Date.now() - lastExtraAt.current < 60000) return;
+    extraReading.current = true;
+    lastExtraAt.current = Date.now();
+    try {
+      const result = await ubus<NetworkExtra>('dlink-cellular', 'sdk_network');
+      if (result.ok === true) setExtra(result);
+    } catch {
+      // 旧后端或基带忙时保留上一次的读数
+    } finally {
+      extraReading.current = false;
+    }
+  }, []);
+
   const load = useCallback(() => {
-    void readRadio(false).then(()=>readQos(true)).then(()=>requestBeams(t=>t+1));
+    void readRadio(false).then(()=>readQos(true)).then(()=>readExtra(true)).then(()=>requestBeams(t=>t+1));
     void sampleTraffic().catch(() => {});
-  }, [readRadio, readQos, sampleTraffic]);
+  }, [readRadio, readQos, readExtra, sampleTraffic]);
 
   useEffect(load, [load]);
   useEffect(() => {
@@ -183,11 +208,15 @@ const Network: React.FC = () => {
   useEffect(() => {
     if (!auto.enabled || !pageVisible) return undefined;
     const id = window.setInterval(() => {
-      void (pushing ? Promise.resolve() : readRadio()).then(()=>readQos()).then(()=>requestBeams(t=>t+1));
+      void (pushing ? Promise.resolve() : readRadio()).then(()=>readQos()).then(()=>readExtra()).then(()=>requestBeams(t=>t+1));
       void sampleTraffic().catch(() => {});
     }, auto.interval * 1000);
     return () => window.clearInterval(id);
-  }, [auto, pageVisible, pushing, readRadio, readQos, sampleTraffic]);
+  }, [auto, pageVisible, pushing, readRadio, readQos, readExtra, sampleTraffic]);
+
+  useEffect(() => {
+    if (access?.sdk) void readExtra(true);
+  }, [access?.sdk, readExtra]);
 
   const reg = data?.register;
   // 制式是 QoS 查询的入参：首屏可能先于 overview 到达，拿到驻留制式后立刻补查一次。
@@ -199,7 +228,17 @@ const Network: React.FC = () => {
   const signal = data?.nr || data?.lte;
   const sinr = signal?.sinr10 != null ? signal.sinr10 / 10 : null;
   const cells = data?.cells;
-  const operator = reg?.plmn ? OPERATORS[reg.plmn] || reg.plmn : '未知运营商';
+  // 基带给出的运营商名优先；只在它与当前驻留 PLMN 一致时采用，避免显示切网前的旧名称。
+  const sdkOperator = extra?.operator && (!extra.operator.plmn || extra.operator.plmn === reg?.plmn)
+    ? operatorLabel(extra.operator) : '';
+  const operator = sdkOperator || (reg?.plmn ? OPERATORS[reg.plmn] || reg.plmn : '未知运营商');
+  const voiceReg = extra?.voice?.state != null
+    ? [REG_STATES[extra.voice.state] ?? '未知', extra.voice.rat != null ? RAT_NAMES[extra.voice.rat] : ''].filter(Boolean).join(' · ')
+    : '—';
+  // EN-DC 是 LTE 锚点上的双连接，SA 驻留时没有意义。
+  const endc = reg?.rat === '5G SA' ? '不适用（SA）'
+    : extra?.endc ? (extra.endc.restricted ? '受限' : extra.endc.available ? '主小区支持' : '不支持') : '—';
+  const tdd = extra?.tdd?.length ? extra.tdd.map(tddLabel).join('；') : '';
   const score = rsrpPercent(signal?.rsrp);
   const signalTone = scoreTone(score);
   const qualityLabel = scoreLabel(score);
@@ -402,9 +441,16 @@ const Network: React.FC = () => {
               { label: '会话 QoS', value: qosValue },
               ...(data?.cqi?.nr != null ? [{ label: 'NR CQI', value: data.cqi.nr }] : []),
               ...(data?.cqi?.lte != null ? [{ label: 'LTE CQI', value: data.cqi.lte }] : []),
+              ...(extra ? [
+                { label: '网络授时', value: nitzLabel(extra.nitz) || '未上报' },
+                { label: '语音域注册', value: voiceReg },
+                { label: '服务域', value: extra.srv_domain === 1 ? 'CS + PS' : extra.srv_domain === 0 ? '仅 PS（数据）' : '—' },
+                { label: 'EN-DC 双连接', value: endc },
+              ] : []),
             ]}
           />
           {qosDetail ? <p className="hint-line hint-line--tight">按活动承载：{qosDetail}</p> : null}
+          {tdd ? <p className="hint-line hint-line--tight">5G TDD 帧结构：{tdd}</p> : null}
         </PageCard>
 
         <PageCard

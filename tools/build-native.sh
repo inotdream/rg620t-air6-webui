@@ -23,6 +23,7 @@ vendor=(-L"$RIL_LIB" -Wl,-rpath-link,"$RIL_LIB" -Wl,--disable-new-dtags,-rpath,/
 loader=(-Wl,--dynamic-linker=/usr/lib/t830-quectel/libc.so -Wl,-z,now)
 "$CC" -O2 -Wall -Wextra -Werror -Wl,--as-needed -I"$RIL_INC" "${vendor[@]}" "$C/dlink-cell.c" -lqlril -o "$s/dlink-cellular"
 "$CC" -O2 -Wall -Wextra -Werror -I"$RIL_INC" ${JSON_C_CFLAGS:-} "${vendor[@]}" "$C/dlink-controls.c" ${JSON_C_LIBS:--ljson-c} -lqlril -o "$s/dlink-controls"
+"$CC" -O2 -Wall -Wextra -Werror -Wl,--as-needed -pthread -I"$RIL_INC" "${vendor[@]}" "$C/dlink-sdk.c" -lqlril -o "$s/dlink-sdk"
 # AT_INC is the SDK libql_at/inc directory (quectel_atcid_sender.h).
 "$CC" -O2 -Wall -Wextra -Werror -I"${AT_INC:-$VENDOR_INC}" ${JSON_C_CFLAGS:-} "${vendor[@]}" "${loader[@]}" "$C/dlink-at-console.c" ${JSON_C_LIBS:--ljson-c} -lql_at -o "$s/dlink-at-console"
 "$CC" -O2 -Wall -Wextra -Werror -Wl,--as-needed -I"$RIL_INC" "${vendor[@]}" "$C/dlink-sms-delete.c" -lqlril -o "$s/dlink-sms-delete"

@@ -6,6 +6,8 @@ import { ubus } from '@/services/deviceUbus';
 import { TAG_COLOR } from '@/ui/tokens';
 import type { Overview } from '@/modules/cellular/telemetry';
 import { engineeringError, simLabels } from '@/modules/cellular/engineering';
+import ApnSettings from '@/modules/cellular/ApnSettings';
+import { useSdkAccess } from '@/modules/cellular/sdk';
 
 type Address4 = { address: string; mask?: number };
 type Address6 = { address: string; mask?: number };
@@ -43,6 +45,7 @@ const duration = (seconds?: number) => {
 const INTERESTING = ['wan', 'modem', 'ccmni', 'lan', 'wwan'];
 
 const Dial: React.FC = () => {
+  const access = useSdkAccess();
   const [rows, setRows] = useState<Iface[]>([]);
   const [busy, setBusy] = useState('');
   const [loading, setLoading] = useState(false);
@@ -274,6 +277,8 @@ const Dial: React.FC = () => {
           {diagIssue ? <p className="engineering-note">{diagIssue}</p> : !checks && <p className="engineering-note">按需读取，不会重拨或改动配置。</p>}
         </PageCard>
       </TwoCol>
+
+      {access?.services ? <ApnSettings onApplied={() => void load()} /> : null}
 
       <PageCard
         title="全部网络接口"

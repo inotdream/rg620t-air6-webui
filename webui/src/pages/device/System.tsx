@@ -1,11 +1,10 @@
-import { Link } from 'react-router-dom';
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Tag, Toast, Typography } from '@douyinfe/semi-ui';
 import { IconActivity, IconClock, IconServer, IconUserGroup, IconWifi } from '@douyinfe/semi-icons';
 import { Kv, Metric, PageCard, RefreshBtn, SectionHeader, TwoCol } from '@/ui/widgets';
 import { QualityBar } from '@/ui/charts';
 import { ubus } from '@/services/deviceUbus';
-import deployInfo from '@/modules/device-build.json';
+import ModemIdentity from '@/modules/cellular/ModemIdentity';
 import { TAG_COLOR, type Tone } from '@/ui/tokens';
 
 type Release = { distribution?: string; version?: string; revision?: string; description?: string };
@@ -168,26 +167,7 @@ const System: React.FC = () => {
           </Typography.Text>
         </PageCard>
 
-        <PageCard
-          title="蜂窝模组"
-          hint="安装此版界面时从设备读取"
-          extra={<Tag size="small" color={TAG_COLOR.success}>部署时核对</Tag>}
-        >
-          <Kv
-            layout="rows"
-            items={[
-              { label: '模组型号', value: 'Quectel RG620T' },
-              { label: '基带版本', value: deployInfo.firmware },
-              { label: '部署时系统槽位', value: deployInfo.systemSlot },
-            ]}
-          />
-          <div className="card-divider" />
-          <Link to="/engineering" className="engineering-link">查看 SIM 与温度、查询基带</Link>
-          <br />
-          <Typography.Text type="tertiary" size="small">
-            基带版本来自 AT+CGMR；后续刷机或切槽后，这份部署记录不会自动变化。
-          </Typography.Text>
-        </PageCard>
+        <ModemIdentity />
       </TwoCol>
 
       <section className="page-section">

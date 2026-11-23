@@ -64,6 +64,20 @@ npm run build -- --mode dlink
 
 首页「服务载波」显示基带上报的最佳 SSB 与波束 RSRP，展开可看各 Rx 接收链。邻区的 RSRQ 与 SINR 取自每个小区自己的测量，不使用主小区数值代填。
 
+### SDK 扩展：身份、选网、APN 与补充业务
+
+`backend/cellular/src/dlink-sdk.c`（Quectel `ql_dm` / `ql_nw` / `ql_sim` / `ql_sms`）与 `dlink-cellular-services`（AT 与 UCI）补上 QuecOpen SDK 文档中尚未接入的接口。`access` 报告 `sdk` / `services`，旧后端上相应入口自动隐藏。
+
+- **设备信息**实时读取 IMEI、模组软件版本、基带版本、模组状态及 SIM 的 ICCID、IMSI、本机号码，号码类默认打码。
+- **网络状态**补充基带运营商名、网络授时（NITZ，本固件时区单位为分钟）、语音域注册、服务域、EN-DC 与 5G TDD 帧结构，一分钟读一次。
+- **锁频锁小区**新增网络模式（`ql_nw_set_nwmode`：21 = 3G/4G/5G，19 = 4G/5G，15 = 仅 SA，3 = 仅 LTE）、飞行模式、运营商搜索（后台进程持锁，最长 240 秒）、手动注册与恢复自动选网。
+- **拨号与接口**可修改 `network.wan` 的 APN、IP 类型、认证与账号；密码只经 stdin 传递、读取时不返回，保存后可选立即重拨。
+- **短信中心**工具栏提供短信中心号码读写与单次 USSD 查询；非 UTF-8 回复按 UCS2 解码。
+- **语音通话**提供呼叫等待与四类呼叫转移（`AT+CCFC` / `AT+CCWA`）。5G SA/VoNR 下没有 CS 注册，需运营商 XCAP（Ut）；基带返回 `+CME ERROR: 30` 时页面显示「不可用」并说明原因。
+- **工程工具**温度卡显示 `AT+QTEMP` 的降频等级。
+
+所有写操作先核对调用时读到的旧值（`expected` / `revision`），写入后读回；任一不一致即报错，不会覆盖别处的修改。验证入口：`tests/sdk-native.sh`（fake SDK，macOS/Linux）、`tests/services-host.sh`（宿主 jshn、假 UCI 与基带）。
+
 ### 推送借用现有 HTTPS
 
 设备的 `dlink-cellular-events` procd 服务为有订阅的浏览器共享采样：`POST /cgi-bin/rg620-events` 用请求体传当前会话并核对 rpcd 对相应接口的读权限。流只传网络快照和短信变更信号，正文仍走原短信接口。每个设备保留一个短时流槽，其他标签和不具推送能力的旧后端自动走轮询。来电继续使用原有提醒路径。事件流由设备端采样触发，不依赖尚未证实能上报的基带回调。

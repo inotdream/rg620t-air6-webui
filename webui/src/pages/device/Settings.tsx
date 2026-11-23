@@ -7,6 +7,8 @@ import { Link, useSearchParams } from 'react-router-dom';
 import { useCellularStream } from '@/modules/cellular/stream';
 import { lockMatch, servingCarriers, type Overview } from '@/modules/cellular/telemetry';
 import { TAG_COLOR, ratTagColor } from '@/ui/tokens';
+import NetworkSelection from '@/modules/cellular/NetworkSelection';
+import { useSdkAccess } from '@/modules/cellular/sdk';
 import {
   type Cell,
   type LockCandidate as Candidate,
@@ -74,6 +76,7 @@ const Chips: React.FC<{
 );
 
 const Settings: React.FC = () => {
+  const access = useSdkAccess();
   const [locks, setLocks] = useState<Locks | null>(null);
   const [overview, setOverview] = useState<Overview | null>(null);
   const { snapshot: live, status: liveStatus } = useCellularStream(true);
@@ -567,6 +570,8 @@ const Settings: React.FC = () => {
           </Typography.Text>
         </PageCard>
       </section>
+
+      {access?.sdk ? <NetworkSelection /> : null}
     </div>
   );
 };

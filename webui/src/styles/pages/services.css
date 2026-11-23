@@ -1,0 +1,87 @@
+/* SDK 扩展功能：选网、APN、短信中心与 USSD、呼叫转移/等待。 */
+.service-note {
+  margin: 0;
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-sm);
+}
+.service-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.service-form {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-3) var(--space-4);
+}
+.service-form .field--wide { grid-column: 1 / -1; }
+.service-form .semi-select { width: 100%; }
+.service-footer {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+}
+
+.plmn-list {
+  margin: var(--space-3) 0 0;
+  padding: 0;
+  list-style: none;
+}
+.plmn-row,
+.cf-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: var(--space-3);
+  padding-block: var(--space-3);
+}
+.plmn-row + .plmn-row,
+.cf-row + .cf-row { border-top: 1px solid var(--color-border); }
+.plmn-name,
+.cf-label {
+  display: grid;
+  gap: var(--space-0-5);
+  min-width: 0;
+}
+.plmn-name small,
+.cf-label small {
+  color: var(--color-text-tertiary);
+  font-size: var(--font-size-xs);
+  overflow-wrap: anywhere;
+}
+.cf-state {
+  color: var(--color-text-secondary);
+  font-size: var(--font-size-sm);
+  font-variant-numeric: tabular-nums;
+}
+
+.ussd-form {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: var(--space-2);
+}
+.ussd-form input { font-family: var(--font-family-mono); }
+.ussd-reply {
+  margin: var(--space-3) 0 0;
+  padding: var(--space-3);
+  max-height: 16em;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  background: var(--color-surface-subtle);
+  border: 1px solid var(--color-border);
+  border-radius: var(--radius-md);
+}
+.sms-services { display: grid; gap: var(--space-5); }
+
+@media (max-width: 767px) {
+  .service-form { grid-template-columns: minmax(0, 1fr); }
+  .plmn-row,
+  .cf-row { grid-template-columns: minmax(0, 1fr) auto; }
+  .plmn-row > .service-actions,
+  .cf-row > .cf-state { grid-column: 1 / -1; grid-row: 2; }
+}
