@@ -120,9 +120,21 @@ JF
 chmod 755 "$d/sdk" "$d/voice" "$d/bin/jsonfilter"
 printf 'dlink,dwr-be7200g\n' > "$d/board"
 printf 'root:fixture-only:0:0:0:0:::\n' > "$d/shadow"
+cat > "$d/cell" <<'CELL'
+#!/bin/sh
+if [ "$1" = locks ]; then
+	printf '%s\n' "${DLINK_LOCK_RPC_V2:-0}" > "$MODEM/lock-cap"
+else
+	printf '%s\n' "$*" >> "$MODEM/cell"
+	[ -z "${DLINK_LOCK_RPC_V2-}" ] || exit 1
+fi
+printf '{"ok":true}\n'
+CELL
+chmod 755 "$d/cell"
 sed -e "s|/tmp/sysinfo/board_name|$d/board|g" -e "s|/etc/shadow|$d/shadow|g" \
     -e "s|/usr/libexec/dlink-sdk|$d/sdk|g" -e "s|/usr/libexec/dlink-cellular-services|$d/services|g" \
     -e "s|/usr/libexec/dlink-cellular-voice|$d/voice|g" -e "s|/usr/share/libubox/jshn.sh|$JSHN_DIR/jshn.sh|g" \
+    -e "s|run_helper /usr/libexec/dlink-cellular \"\\\$@\"|run_helper $d/cell \"\$@\"|" \
     "$root/usr/libexec/rpcd/dlink-cellular" > "$d/rpc"
 chmod 755 "$d/services"
 rpc() { printf '%s' "$2" | "$run_sh" "$d/rpc" call "$1"; }
@@ -148,7 +160,21 @@ rpc ussd_send '{"code":"*100#","confirm":true}' >/dev/null
 eq "$(cat "$MODEM/sdk")" "$(printf '%s\n' identity plmn_scan_status 'airplane_set 1 0' 'nwmode_set 3 19' \
     'plmn_set manual 46001 12' 'plmn_set auto' plmn_scan_start 'smsc_set +8613800100500 -' 'ussd *100#')"
 expect "$(rpc cw_query '{}')" '"enabled":true'
+expect "$(rpc locks '{}')" '"ok":true'
+eq "$(cat "$MODEM/lock-cap")" 1
+expect "$(rpc cell_set '{"rat":"NR","arfcn":"633984","pci":"229","apply":"yes","confirm":true}')" '"error":"input"'
+expect "$(rpc cell_set '{"rat":"NR","arfcn":"633984","pci":"any","confirm":true}')" '"error":"input"'
+expect "$(rpc cell_set '{"rat":"NR","arfcn":"633984","pci":"1","kind":"band","confirm":true}')" '"error":"input"'
+rpc cell_set '{"rat":"NR","arfcn":"633984","pci":"229","confirm":true}' >/dev/null
+rpc cell_set '{"rat":"NR","arfcn":"633984","pci":"229","apply":true,"confirm":true}' >/dev/null
+rpc cell_set '{"rat":"NR","arfcn":"633984","kind":"arfcn","apply":false,"confirm":true}' >/dev/null
+rpc cell_clear '{"apply":true,"confirm":true}' >/dev/null
+rpc cell_list_set '{"cells":"NR:633984:229,NR:176190:20","apply":true,"confirm":true}' >/dev/null
+rpc cell_list_clear '{"confirm":true}' >/dev/null
+rpc band_set '{"rat":"LTE","bands":"3","apply":"ignored-by-legacy","confirm":true}' >/dev/null
+eq "$(cat "$MODEM/cell")" "$(printf '%s\n' 'cell_set NR 633984 229' 'cell_set NR 633984 229 apply' 'cell_set NR 633984 any' \
+    'cell_set clear apply' 'cell_list NR:633984:229,NR:176190:20 apply' 'cell_list clear' 'band_set LTE 3')"
 printf 'root:!:0:0:0:0:::\n' > "$d/shadow"
 expect "$(rpc sdk_radio '{}')" '"error":"password_required"'
 expect "$(rpc apn_get '{}')" '"error":"password_required"'
-echo 'PASS: rpcd confirmation and type checks, exact helper argv, call guard, password-protected endpoints'
+echo 'PASS: rpcd confirmation and type checks, exact helper argv, call guard, cell lock apply/kind, password-protected endpoints'

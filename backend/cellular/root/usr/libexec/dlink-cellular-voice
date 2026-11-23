@@ -6,8 +6,14 @@ op="$1"
 shift
 parser=/usr/libexec/dlink-cellular-voice.awk
 at() { timeout 9 /usr/bin/mipc_wan_cli --at_cmd "$1" 2>/dev/null; }
-exec 9>/var/lock/dlink-cellular.lock || { error busy; exit 0; }
-flock -w 1 9 || { error busy; exit 0; }
+if [ "$op" = reselect-idle ]; then
+	# Read-only private probe. The lock helper passes its already locked open file as fd 9.
+	# Reserved exit codes distinguish this protocol from legacy helpers returning JSON and 0.
+	flock -n 9 || exit 12
+else
+	exec 9>/var/lock/dlink-cellular.lock || { error busy; exit 0; }
+	flock -w 1 9 || { error busy; exit 0; }
+fi
 
 at_ok=0
 calls=
@@ -17,10 +23,14 @@ fi
 # MIPC IDs are not AT call indices. Use them only for observation.
 if [ -z "$calls" ]; then
 	case "$op" in
-	status|dial)
+	status|dial|reselect-idle)
 		native=
 		if out="$(timeout 2 /usr/bin/mipc_wan_cli --get_call_status 2>/dev/null)" &&
 		   native="$(printf '%s\n' "$out" | awk -f /usr/libexec/dlink-cellular-mipc-calls.awk)"; then
+			if [ "$op" = reselect-idle ]; then
+				[ "$native" = count:0 ] && exit 10
+				exit 11
+			fi
 			case "$native" in
 			count:0) ;;  # AT's valid empty result remains actionable.
 			*) if [ "$op" = dial ]; then error call_present; exit 0; fi;;
@@ -39,6 +49,11 @@ if [ -z "$calls" ]; then
 		fi
 		;;
 	esac
+fi
+if [ "$op" = reselect-idle ]; then
+	[ "$at_ok" = 1 ] || exit 12
+	[ -z "$calls" ] && exit 10
+	exit 11
 fi
 [ "$at_ok" = 1 ] || { error voice_status_unavailable; exit 0; }
 

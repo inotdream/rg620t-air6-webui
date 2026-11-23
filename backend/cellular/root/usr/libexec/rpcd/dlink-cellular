@@ -2,7 +2,7 @@
 
 if [ "$1" = list ]; then
 	cat <<'JSON'
-{"overview":{},"summary":{},"qos":{"rat":"","contexts":true},"locks":{},"access":{},"diag":{},"diag_checks":{},"voice_status":{},"voice_dial":{"number":"","confirm":true},"voice_answer":{"id":"","confirm":true,"ringing_only":true,"peer":""},"voice_hangup":{"id":"","confirm":true,"ringing_only":true,"peer":""},"voice_dtmf":{"id":"","key":"","confirm":true},"capture_status":{},"capture_start":{"seconds":0,"confirm":true},"capture_stop":{},"wan_redial":{"confirm":true},"band_set":{"rat":"", "bands":"", "confirm":true},"cell_set":{"rat":"", "arfcn":"", "pci":"", "confirm":true},"cell_clear":{"confirm":true},"cell_list_set":{"cells":"", "confirm":true},"cell_list_clear":{"confirm":true},"sms_list":{},"sms_read":{"index":0},"sms_send":{"to":"", "body":"", "confirm":true},"sms_delete":{"index":0,"pdu":"","records":[],"confirm":true},"engineering_info":{},"at_query":{"command":""},"at_send":{"command":"","confirm":true},"mimo_info":{},"sim_status":{},"mimo_set":{"rat":"","enabled":true,"confirm":true},"wifi_power_set":{"radio":"","percent":0,"expected":0,"confirm":true},"scan_status":{},"scan_start":{"rat":"","scope":"","confirm":true},"scan_stop":{"confirm":true},"wan_auto_set":{"enabled":true,"expected":true,"confirm":true},"beam_info":{},"sim_protection":{},"radio_policy":{},"radio_policy_set":{"setting":"","value":0,"expected":0,"confirm":true},"sim_action":{"action":"","secret":"","new_pin":"","remaining":0,"confirm":true},"wifi_flag_set":{"radio":"","flag":"","enabled":true,"expected":true,"confirm":true},"events_sms":{},"sdk_identity":{},"sdk_network":{},"sdk_radio":{},"airplane_set":{"enabled":true,"expected":true,"confirm":true},"nwmode_set":{"value":0,"expected":0,"confirm":true},"plmn_set":{"mode":"","plmn":"","act":0,"confirm":true},"plmn_scan_start":{"confirm":true},"plmn_scan_status":{},"smsc_get":{},"smsc_set":{"address":"","expected":"","confirm":true},"ussd_send":{"code":"","confirm":true},"apn_get":{},"apn_set":{"apn":"","username":"","password":"","auth":0,"iptype":0,"revision":"","confirm":true},"cf_query":{"reason":0},"cf_set":{"reason":0,"enabled":true,"number":"","time":0,"confirm":true},"cw_query":{},"cw_set":{"enabled":true,"confirm":true}}
+{"overview":{},"summary":{},"qos":{"rat":"","contexts":true},"locks":{},"access":{},"diag":{},"diag_checks":{},"voice_status":{},"voice_dial":{"number":"","confirm":true},"voice_answer":{"id":"","confirm":true,"ringing_only":true,"peer":""},"voice_hangup":{"id":"","confirm":true,"ringing_only":true,"peer":""},"voice_dtmf":{"id":"","key":"","confirm":true},"capture_status":{},"capture_start":{"seconds":0,"confirm":true},"capture_stop":{},"wan_redial":{"confirm":true},"band_set":{"rat":"", "bands":"", "confirm":true},"cell_set":{"rat":"", "arfcn":"", "pci":"", "kind":"", "apply":true, "confirm":true},"cell_clear":{"apply":true, "confirm":true},"cell_list_set":{"cells":"", "apply":true, "confirm":true},"cell_list_clear":{"apply":true, "confirm":true},"sms_list":{},"sms_read":{"index":0},"sms_send":{"to":"", "body":"", "confirm":true},"sms_delete":{"index":0,"pdu":"","records":[],"confirm":true},"engineering_info":{},"at_query":{"command":""},"at_send":{"command":"","confirm":true},"mimo_info":{},"sim_status":{},"mimo_set":{"rat":"","enabled":true,"confirm":true},"wifi_power_set":{"radio":"","percent":0,"expected":0,"confirm":true},"scan_status":{},"scan_start":{"rat":"","scope":"","confirm":true},"scan_stop":{"confirm":true},"wan_auto_set":{"enabled":true,"expected":true,"confirm":true},"beam_info":{},"sim_protection":{},"radio_policy":{},"radio_policy_set":{"setting":"","value":0,"expected":0,"confirm":true},"sim_action":{"action":"","secret":"","new_pin":"","remaining":0,"confirm":true},"wifi_flag_set":{"radio":"","flag":"","enabled":true,"expected":true,"confirm":true},"events_sms":{},"sdk_identity":{},"sdk_network":{},"sdk_radio":{},"airplane_set":{"enabled":true,"expected":true,"confirm":true},"nwmode_set":{"value":0,"expected":0,"confirm":true},"plmn_set":{"mode":"","plmn":"","act":0,"confirm":true},"plmn_scan_start":{"confirm":true},"plmn_scan_status":{},"smsc_get":{},"smsc_set":{"address":"","expected":"","confirm":true},"ussd_send":{"code":"","confirm":true},"apn_get":{},"apn_set":{"apn":"","username":"","password":"","auth":0,"iptype":0,"revision":"","confirm":true},"cf_query":{"reason":0},"cf_set":{"reason":0,"enabled":true,"number":"","time":0,"confirm":true},"cw_query":{},"cw_set":{"enabled":true,"confirm":true}}
 JSON
 	exit 0
 fi
@@ -122,7 +122,8 @@ case "$2" in
 		[ -x /usr/libexec/dlink-cellular-services ] || { error unsupported; exit 0; }
 		# The helper reads this request from stdin; the APN password never reaches argv.
 		run_helper /usr/libexec/dlink-cellular-services "$2";;
-	overview|summary|locks) run "$2";;
+	overview|summary) run "$2";;
+	locks) export DLINK_LOCK_RPC_V2=1; run locks;;
 	at_send)
         protected || { error password_required; exit 0; }
         run_helper /usr/libexec/dlink-at-console;;
@@ -232,9 +233,28 @@ case "$2" in
 				json_get_type ctype confirm
 				[ "$ctype:$confirmed" = boolean:1 ] || { error confirm; exit 0; }
 				case "$2" in
+					cell_set|cell_clear|cell_list_set|cell_list_clear)
+						apply=
+						json_get_type at apply || :
+						case "$at" in
+							'') ;;
+							boolean) json_get_var av apply; [ "$av" != 1 ] || apply=apply;;
+							*) error input; exit 0;;
+						esac;;
+				esac
+				case "$2" in
 					band_set) json_get_var rat rat; json_get_var bands bands; run band_set "$rat" "$bands";;
-					cell_set) json_get_var rat rat; json_get_var arfcn arfcn; json_get_var pci pci; run cell_set "$rat" "$arfcn" "$pci";;
-					cell_clear) run cell_set clear;;
+					cell_set)
+						json_get_var rat rat; json_get_var arfcn arfcn
+						json_get_type kt kind || :
+						kind=cell; [ -z "$kt" ] || json_get_var kind kind
+						case "$kt:$kind" in
+							:cell|string:cell) json_get_var pci pci; case "$pci" in ''|*[!0-9]*) error input; exit 0;; esac;;
+							string:arfcn) pci=any;;
+							*) error input; exit 0;;
+						esac
+						run cell_set "$rat" "$arfcn" "$pci" $apply;;
+					cell_clear) run cell_set clear $apply;;
 					capture_start) json_get_var seconds seconds; /usr/libexec/dlink-cellular-control start "$seconds";;
 					wan_redial) /usr/libexec/dlink-cellular-control redial;;
 					voice_dial) json_get_var number number; /usr/libexec/dlink-cellular-voice dial "$number";;
@@ -258,8 +278,8 @@ case "$2" in
 					cell_list_set)
 						json_get_var cells cells
 						[ "$cells" != clear ] || { error input; exit 0; }
-						run cell_list "$cells";;
-					cell_list_clear) run cell_list clear;;
+						run cell_list "$cells" $apply;;
+					cell_list_clear) run cell_list clear $apply;;
 					sms_delete)
 						[ -x /usr/libexec/dlink-sms-delete ] || { error unsupported; exit 0; }
 						if json_get_type records_type records; then

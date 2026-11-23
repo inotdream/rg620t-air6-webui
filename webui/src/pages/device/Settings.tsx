@@ -8,20 +8,31 @@ import { useCellularStream } from '@/modules/cellular/stream';
 import { lockMatch, servingCarriers, type Overview } from '@/modules/cellular/telemetry';
 import { TAG_COLOR, ratTagColor } from '@/ui/tokens';
 import NetworkSelection from '@/modules/cellular/NetworkSelection';
+import LockOptions from '@/modules/cellular/LockOptions';
 import { useSdkAccess } from '@/modules/cellular/sdk';
 import {
+  applyError, campText, lockRequest, requestCellLock, waitForCamp, type CampTarget, type LockKind, type LockReply,
+} from '@/modules/cellular/lockApply';
+import {
   type Cell,
-  type LockCandidate as Candidate,
+  type LockCandidate,
   type Rat,
-  cellKey as keyOf,
-  cellLabel as labelOf,
+  cellKey,
+  cellLabel,
   toCandidate,
 } from '@/modules/cellular/types';
 
+type Candidate = Omit<LockCandidate, 'pci'> & { pci?: number };
+const keyOf = (c: Candidate) => c.pci == null ? `${c.rat}:${c.arfcn}:any` : cellKey({ ...c, pci: c.pci });
+const labelOf = (c: {rat: string; arfcn: number; pci?: number}) => c.pci == null
+  ? `${c.rat} ${c.arfcn} · 任意 PCI` : cellLabel({ ...c, pci: c.pci });
 type LockCell = { opt: number; rat: string; arfcn: number; pci: number; mode: number };
 type Locks = {
   ok?: boolean;
+  lock_api?: number;
   cell?: LockCell | null;
+  /** 基带不提供白名单回读；这是后端记录的最近一次提交 */
+  list?: Array<{ rat: string; arfcn: number; pci: number }> | null;
   current?: { lte: number[]; nr: number[] } | null;
   supported?: { lte: number[]; nr: number[] } | null;
 };
@@ -31,6 +42,7 @@ const LIMIT: Record<Rat, { arfcn: number; pci: number }> = {
   LTE: { arfcn: 262143, pci: 503 },
 };
 const ERRORS: Record<string, string> = {
+  timeout: '设备回执超时，规则可能已经写入。请先刷新锁定配置与实际驻留，不要重复提交。',
   input: '输入不合法，检查 ARFCN 与 PCI 的范围。',
   cell_read: '基带读不到当前锁定状态。',
   cell_write: '基带拒绝了单小区锁定请求。',
@@ -93,6 +105,12 @@ const Settings: React.FC = () => {
       ? { rat, arfcn, pci } : { rat: 'NR', arfcn: '', pci: '' };
   });
   const [picked, setPicked] = useState<Candidate[]>([]);
+  const [choice, setKind] = useState<LockKind>('cell');
+  const [applyNow, setApplyNow] = useState(true);
+  const extended = locks?.lock_api === 2;
+  const kind = extended ? choice : 'cell';
+  const apply = extended && applyNow;
+  const writing = useRef(false);
   const [busy, setBusy] = useState('');
   const [loading, setLoading] = useState(false);
   const [note, setNote] = useState('');
@@ -138,6 +156,8 @@ const Settings: React.FC = () => {
   }, [load]);
 
   const run = async (name: string, task: () => Promise<unknown>, ok: string) => {
+    if (writing.current) return;
+    writing.current = true;
     setBusy(name);
     setNote('');
     try {
@@ -150,15 +170,61 @@ const Settings: React.FC = () => {
       setNote(text);
       Toast.error(text);
     } finally {
+      writing.current = false;
       setBusy('');
     }
   };
 
-  const singleLocked = Boolean(locks?.cell?.opt);
+  // 锁定只改变基带的选网规则；勾选「立即重新驻留」时后端重启射频，这里再核对实际主小区。
+  const lockAction = async (name: string, task: () => Promise<LockReply>, ok: string, target: CampTarget, lockKind: LockKind) => {
+    if (writing.current) return;
+    writing.current = true;
+    setBusy(name);
+    setNote('');
+    try {
+      const reply = await task();
+      if (reply.recorded === false) ok += '；未能保存本地白名单记录';
+      if (reply.applied) {
+        setNote(`${ok}；射频已重启，正在重新驻留…`);
+        const result = await waitForCamp(target, lockKind, (s) => setNote(`${ok}；射频已重启，正在重新驻留…已等待 ${s} 秒`));
+        const text = `${ok}；${campText(result, target, lockKind)}`;
+        setNote(text);
+        if (result === 'matched' && reply.recorded !== false) Toast.success(text); else Toast.warning(text);
+      } else {
+        const warn = applyError(reply.apply_error);
+        setNote(warn ? `${ok}；${warn}` : `${ok}；将在基带下次重选小区时生效`);
+        if (reply.apply_error === 'radio_off') Toast.error(warn); else if (warn || reply.recorded === false) Toast.warning(warn || ok); else Toast.success(ok);
+      }
+      await load().catch(() => undefined);
+    } catch (error) {
+      const text = pickError(error);
+      setNote(text);
+      Toast.error(text);
+    } finally {
+      writing.current = false;
+      setBusy('');
+    }
+  };
+
+  const lockCell = locks?.cell;
+  const singleLocked = Boolean(lockCell?.opt);
+  const whitelist = locks?.list || [];
 
   const serving = servingCarriers(overview);
-  const match = locks?.cell?.opt ? lockMatch(locks.cell, serving) : 'unknown';
-  const candidates = useMemo<Candidate[]>(
+  const match = !lockCell?.opt ? 'unknown'
+    : lockCell.opt === 2
+      ? serving.some((s) => s.rat === lockCell.rat && s.arfcn === lockCell.arfcn) ? 'matched' : serving.length ? 'different' : 'unknown'
+      : lockMatch(lockCell, serving);
+  const inWhitelist = serving.some((s) => whitelist.some((w) => w.rat === s.rat && w.arfcn === s.arfcn && w.pci === s.pci));
+  const lockTitle = lockCell?.opt === 2 ? `${lockCell.rat} 频点 ${lockCell.arfcn} · 任意 PCI`
+    : lockCell?.opt ? `${lockCell.rat} ${lockCell.arfcn} / PCI ${lockCell.pci}` : '';
+  const reapply = () => {
+    if (!extended || !lockCell?.opt) return;
+    const lockKind = lockCell.opt === 2 ? 'arfcn' : 'cell';
+    void lockAction('reapply', () => requestCellLock(lockCell, lockKind, true, extended),
+      `重新应用锁定 ${lockTitle}`, lockCell, lockKind);
+  };
+  const candidates = useMemo<LockCandidate[]>(
     () => (overview?.cells || []).filter((item: Cell) => item.rat === 'NR' || item.rat === 'LTE').map(toCandidate),
     [overview?.cells],
   );
@@ -180,15 +246,16 @@ const Settings: React.FC = () => {
     const { rat } = manual;
     const arfcn = Number(manual.arfcn);
     const pci = Number(manual.pci);
-    if (!Number.isInteger(arfcn) || arfcn <= 0 || arfcn > LIMIT[rat].arfcn) {
-      setNote(`ARFCN 超出 ${rat} 的范围（1-${LIMIT[rat].arfcn}）`);
+    if (!/^\d+$/.test(manual.arfcn.trim()) || !Number.isInteger(arfcn) || arfcn < (rat === 'LTE' ? 0 : 1) || arfcn > LIMIT[rat].arfcn) {
+      setNote(`ARFCN 超出 ${rat} 的范围（${rat === 'LTE' ? 0 : 1}-${LIMIT[rat].arfcn}）`);
       return;
     }
-    if (!Number.isInteger(pci) || pci < 0 || pci > LIMIT[rat].pci) {
+    const anyPci = kind === 'arfcn' && manual.pci.trim() === '';
+    if (!anyPci && (!/^\d+$/.test(manual.pci.trim()) || !Number.isInteger(pci) || pci < 0 || pci > LIMIT[rat].pci)) {
       setNote(`PCI 超出 ${rat} 的范围（0-${LIMIT[rat].pci}）`);
       return;
     }
-    togglePicked({ rat, arfcn, pci });
+    togglePicked({ rat, arfcn, pci: anyPci ? undefined : pci });
     setManual({ ...manual, arfcn: '', pci: '' });
   };
 
@@ -196,16 +263,20 @@ const Settings: React.FC = () => {
     setList(list.includes(band) ? list.filter((item) => item !== band) : [...list, band].sort((a, b) => a - b));
 
   const pickedOne = picked.length === 1 ? picked[0] : null;
-  const canSubmitList = picked.length >= 2 && !singleLocked;
+  const hasFrequencyOnly = picked.some(item => item.pci == null);
+  const canSubmitList = picked.length >= 2 && !singleLocked && !hasFrequencyOnly;
 
   const clearCellLocks = () =>
-    run(
+    lockAction(
       'clear',
       async () => {
-        await ubus('dlink-cellular', 'cell_clear', { confirm: true });
-        await ubus('dlink-cellular', 'cell_list_clear', { confirm: true });
+        await lockRequest('cell_clear', {});
+        try { return await lockRequest('cell_list_clear', extended ? { apply } : {}); }
+        catch (error) { await load().catch(() => undefined); throw new Error('单锁已解除；白名单解除未确认：' + pickError(error)); }
       },
-      '已解除小区锁定',
+      '已解除小区锁定和白名单',
+      null,
+      'cell',
     );
 
   return (
@@ -214,12 +285,12 @@ const Settings: React.FC = () => {
       <PageCard
         variant="hero"
         title="锁定配置与实际驻留"
-        hint="以实际驻留的制式、频点和 PCI 核对；本页不会重启射频"
+        hint={extended ? '按实际驻留的主小区核对；立即重新驻留会短暂重启射频' : '按实际驻留的主小区核对'}
         extra={
           <Space spacing={8}>
-            {singleLocked ? (
-              <Button size="small" type="danger" icon={<IconUnlock />} loading={busy === 'clear'} onClick={clearCellLocks}>
-                解除锁定
+            {singleLocked || whitelist.length ? (
+              <Button size="small" type="danger" icon={<IconUnlock />} loading={busy === 'clear'} disabled={!!busy || loading} onClick={clearCellLocks}>
+                {apply ? '解除并重新驻留' : '解除锁定'}
               </Button>
             ) : null}
             <Link to="/engineering?to=scan" className="engineering-link">扫小区</Link>
@@ -230,23 +301,36 @@ const Settings: React.FC = () => {
         }
       >
         <div className="status-grid">
-          <div className={`status-box${singleLocked ? ' status-box--warn' : ' status-box--ok'}`}>
+          <div className={`status-box${singleLocked || whitelist.length ? ' status-box--warn' : ' status-box--ok'}`}>
             <div className="status-box-label">
-              {singleLocked ? <IconLock size="small" /> : <IconUnlock size="small" />}
-              单小区锁
+              {singleLocked || whitelist.length ? <IconLock size="small" /> : <IconUnlock size="small" />}
+              {lockCell?.opt === 2 ? '频点锁' : singleLocked ? '主小区锁（PCC）' : whitelist.length ? '小区白名单' : '小区锁定'}
             </div>
             <div className="status-box-value">
               {singleLocked ? (
                 <div className="status-lock-info">
-                  <Tag color={TAG_COLOR.warning}>
-                    {locks?.cell?.rat} {locks?.cell?.arfcn} / PCI {locks?.cell?.pci}
-                  </Tag>
-                  <span className="status-box-sub">配置已回读 · {match === 'matched' ? '已驻留目标' : match === 'different' ? '仍驻留其他小区' : '未能确认驻留'}</span>
+                  <Tag color={TAG_COLOR.warning}>{lockTitle}</Tag>
+                  <span className="status-box-sub">
+                    配置已回读 · {match === 'matched' ? '已驻留目标' : match === 'different' ? '仍驻留其他小区，锁定尚未生效' : '未能确认驻留'}
+                  </span>
+                  {extended && match === 'different' ? (
+                    <Button size="small" theme="solid" loading={busy === 'reapply'} disabled={!!busy} onClick={reapply}>
+                      重启射频并重新驻留
+                    </Button>
+                  ) : null}
+                </div>
+              ) : whitelist.length ? (
+                <div className="status-lock-info">
+                  <Tag color={TAG_COLOR.warning}>{whitelist.length} 个小区</Tag>
+                  <span className="status-box-sub">
+                    最近一次提交（基带不提供回读）· {serving.length ? inWhitelist ? '主小区在白名单内' : '主小区不在白名单内' : '未读到服务小区'}
+                  </span>
+                  <span className="status-box-sub">{whitelist.map(labelOf).join(' · ')}</span>
                 </div>
               ) : (
                 <div className="status-lock-info">
-                  <Tag color={TAG_COLOR.neutral}>{locks?.cell ? '未设单小区锁' : '未读到锁定配置'}</Tag>
-                  <span className="status-box-sub">{serving.length ? serving.map(labelOf).join(' · ') : '未读到服务小区'}</span>
+                  <Tag color={TAG_COLOR.neutral}>{lockCell ? '未设置单小区锁' : '未读到锁定配置'}</Tag>
+                  <span className="status-box-sub">{serving.length ? `主小区 ${serving.map(labelOf).join(' · ')}` : '未读到服务小区'}</span>
                 </div>
               )}
             </div>
@@ -317,7 +401,7 @@ const Settings: React.FC = () => {
                     run(
                       'nr',
                       () =>
-                        ubus('dlink-cellular', 'band_set', {
+                        lockRequest('band_set', {
                           rat: 'NR',
                           bands: nrBands.length ? nrBands.join(',') : 'auto',
                           confirm: true,
@@ -361,7 +445,7 @@ const Settings: React.FC = () => {
                     run(
                       'lte',
                       () =>
-                        ubus('dlink-cellular', 'band_set', {
+                        lockRequest('band_set', {
                           rat: 'LTE',
                           bands: lteBands.length ? lteBands.join(',') : 'auto',
                           confirm: true,
@@ -390,62 +474,61 @@ const Settings: React.FC = () => {
       <section className="page-section">
         <SectionHeader
           title="小区锁定与白名单"
-          desc="选择 1 个小区提交单小区锁，选择 2 个及以上提交白名单（两种模式互斥）"
+          desc={extended ? '选一个小区可锁定主小区或只锁频点；选多个可提交白名单' : '选一个小区锁定为主小区，选多个可提交白名单'}
         />
         <PageCard
           title="候选小区"
           hint={
             picked.length === 0
               ? '勾选下方基带测量到的小区，或手动输入频点与 PCI'
+              : picked.length === 1 && hasFrequencyOnly && kind === 'cell'
+                ? '精确锁定需要 PCI，请选「只锁频点」或移除后补全小区'
               : picked.length === 1
-                ? '已选 1 个小区，可执行单小区锁定'
-                : `已选 ${picked.length} 个小区，可提交白名单`
+                ? kind === 'arfcn' ? '已选 1 个小区：将锁定它的频点，允许在该频点的小区间切换' : '已选 1 个小区：将锁定为主小区（PCC）'
+                : hasFrequencyOnly ? '白名单每项都需要 PCI，请移除「任意 PCI」项并补全后再添加' : `已选 ${picked.length} 个小区，可提交白名单`
           }
           footer={
             <div className="lock-footer-bar">
+              {extended ? <LockOptions kind={picked.length <= 1 ? kind : undefined} onKind={setKind}
+                apply={applyNow} onApply={setApplyNow} disabled={!!busy} /> : locks && <Typography.Text type="tertiary" size="small">当前后端不支持只锁频点或立即重选。</Typography.Text>}
               <div className="action-row">
-                <Button type="danger" loading={busy === 'clear'} onClick={clearCellLocks}>
+                <Button type="danger" loading={busy === 'clear'} disabled={!locks?.ok || !!busy || loading} onClick={clearCellLocks}>
                   解除全部小区锁
                 </Button>
                 {picked.length > 0 ? <Button onClick={() => setPicked([])}>清空选择</Button> : null}
-              </div>
-              <div className="action-row">
                 <Button
                   theme="solid"
                   type="primary"
-                  disabled={!pickedOne}
+                  disabled={!locks?.ok || !pickedOne || (kind === 'cell' && hasFrequencyOnly) || !!busy || loading}
                   loading={busy === 'cell'}
                   onClick={() => {
                     if (!pickedOne) return;
-                    run(
+                    void lockAction(
                       'cell',
-                      () =>
-                        ubus('dlink-cellular', 'cell_set', {
-                          rat: pickedOne.rat,
-                          arfcn: String(pickedOne.arfcn),
-                          pci: String(pickedOne.pci),
-                          confirm: true,
-                        }),
-                      `配置已回读：${labelOf(pickedOne)}；请看实际驻留`,
+                      () => requestCellLock(pickedOne, kind, apply, extended),
+                      kind === 'arfcn' ? `已锁定频点 ${pickedOne.rat} ${pickedOne.arfcn}` : `已锁定主小区 ${labelOf(pickedOne)}`,
+                      pickedOne,
+                      kind,
                     );
                   }}
                 >
-                  锁定单小区
+                  {kind === 'arfcn' ? '锁定频点' : '锁定主小区'}
                 </Button>
                 <Button
                   theme="solid"
                   type="primary"
-                  disabled={!canSubmitList}
+                  disabled={!locks?.ok || !canSubmitList || !!busy || loading}
                   loading={busy === 'list'}
                   onClick={() =>
-                    run(
+                    void lockAction(
                       'list',
-                      () =>
-                        ubus('dlink-cellular', 'cell_list_set', {
-                          cells: picked.map((item) => `${item.rat}:${item.arfcn}:${item.pci}`).join(','),
-                          confirm: true,
-                        }),
-                      `基带已接受白名单，无法回读列表；请看实际驻留`,
+                      () => lockRequest('cell_list_set', {
+                        cells: picked.map((item) => `${item.rat}:${item.arfcn}:${item.pci}`).join(','),
+                        ...(extended ? { apply } : {}),
+                      }),
+                      `已提交 ${picked.length} 个小区的白名单`,
+                      picked,
+                      'cell',
                     )
                   }
                 >
@@ -460,6 +543,13 @@ const Settings: React.FC = () => {
               type="warning"
               closeIcon={null}
               description="当前已有单小区锁。直接锁定新小区会覆盖现有设置；如需提交白名单，请先点击「解除锁定」。"
+              className="card-banner"
+            />
+          ) : whitelist.length ? (
+            <Banner
+              type="warning"
+              closeIcon={null}
+              description="这里显示最近提交的白名单，不是基带回读。要改为单小区锁，请先解除全部小区锁。"
               className="card-banner"
             />
           ) : null}
@@ -515,7 +605,7 @@ const Settings: React.FC = () => {
                 locks?.cell?.opt &&
                   locks.cell.rat === item.rat &&
                   locks.cell.arfcn === item.arfcn &&
-                  locks.cell.pci === item.pci,
+                  (locks.cell.opt === 2 || locks.cell.pci === item.pci),
               );
               return (
                 <label className={`candidate-row${active ? ' active' : ''}`} key={keyOf(item)}>
@@ -527,7 +617,7 @@ const Settings: React.FC = () => {
                   <span className="candidate-lock">
                     {lockedHere ? (
                       <Tag color={TAG_COLOR.warning} size="small">
-                        锁定目标
+                        {lockCell?.opt === 2 ? '锁定频点' : '锁定目标'}
                       </Tag>
                     ) : null}
                     {lockMatch(item, serving) === 'matched' ? (

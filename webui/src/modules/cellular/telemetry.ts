@@ -25,7 +25,7 @@ export function servingCarriers(overview?: Overview | null) {
   const reg = overview?.register;
   if (!hasDataService(reg)) return [];
   return (overview?.carriers || []).filter((item) =>
-    item.primary === true && Number.isSafeInteger(item.arfcn) && item.arfcn > 0 &&
+    item.primary === true && Number.isSafeInteger(item.arfcn) && item.arfcn >= (item.rat === 'LTE' ? 0 : 1) &&
     Number.isSafeInteger(item.pci) && item.pci >= 0 &&
     (item.rat === 'NR' ? item.pci <= 1007 && item.arfcn <= 3279165 : item.rat === 'LTE' && item.pci <= 503 && item.arfcn <= 262143) &&
     (reg?.rat === '5G NSA' || (reg?.rat === '5G SA' && item.rat === 'NR') || (reg?.rat === 'LTE' && item.rat === 'LTE')));

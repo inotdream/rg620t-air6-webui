@@ -21,7 +21,8 @@ const completeCells = Array.from({length:14}, (_,i)=>{
   const [band,arfcn]=testBands[i % testBands.length];
   return {rat:'NR', band, arfcn, pci:100+i, rsrp:-88-i*1.25, sinr:12-i*1.5, cell:'0'};
 }).flatMap(cell=>[cell,{...cell}]);
-let lockOpt=1;
+let lockOpt=1, lockApi=0, lockList=null, sdkTest=false, availableBytes=60*1024*1024;
+const secondary = { ...carrier, primary:false, arfcn:636666, pci:0, band:78 };
 let modemTemp = '+QTEMP:"","0.0","0"\r\n+QTEMP:"SOC_On_Die","71.8","0"\r\n+QTEMP:"PA_Group1_NTC","63.2","0"\r\n+QTEMP:"RFIC_NTC","-128.0","0"\r\nOK';
 let thermal = [{ sensor: 'soc', milli_c: 53400 }, { sensor: 'wmac', milli_c: 61500 }];
 let wifiCase='driver';
@@ -69,11 +70,19 @@ const server = http.createServer(async (req, res) => {
       result=wifiCase==='driver'?{up:true}:{};
     } else if (object === 'dlink-cellular') {
       switch (method) {
+        case 'access': result={ok:true,sdk:sdkTest,services:false};break;
+        case 'sdk_identity': result={ok:true,imei:'111111111111111',firmware:null,sim:{state:'ready',number:'+8610000000000',iccid:'12345678901234567890',imsi:'123456789012345'}};break;
         case 'summary':
         case 'overview': result = overview; break;
-        case 'locks': result = { ok: true, cell: lockOpt===null?null:{ opt: lockOpt, rat: 'NR', arfcn: lockArfcn, pci: 0, mode: 3 },
+        case 'locks': result = { ok: true, ...(lockApi ? {lock_api:lockApi,list:lockList} : {}), cell: lockOpt===null?null:{ opt: lockOpt, rat: 'NR', arfcn: lockArfcn, pci: 0, mode: 3 },
           supported: { nr: [5, 78], lte: [3] }, current: { nr: [5, 78], lte: [3] } }; break;
-        case 'cell_set': lockArfcn = +params.arfcn; break;
+        case 'cell_set':
+          lockArfcn = +params.arfcn;
+          if (lockApi) { lockOpt=params.kind==='arfcn'?2:1; result={ok:true,applied:!!params.apply}; }
+          break;
+        case 'cell_clear': if(lockApi){lockOpt=0;result={ok:true,applied:!!params.apply};}break;
+        case 'cell_list_set': if(lockApi){lockList=params.cells.split(',').map(row=>{const [rat,arfcn,pci]=row.split(':');return {rat,arfcn:+arfcn,pci:+pci};});result={ok:true,applied:!!params.apply,recorded:true,verified:false};} break;
+        case 'cell_list_clear': if(lockApi){lockList=[];result={ok:true,applied:!!params.apply,recorded:true,verified:false};}break;
         case 'voice_status': result = { ok: true, calls: [] }; break;
         case 'sms_list': result = { ok: true, indexes: [] }; break;
         case 'qos': result = { ok: true, kind: '5QI', sessions: [
@@ -105,6 +114,8 @@ const server = http.createServer(async (req, res) => {
         case 'scan_start': scanState = 'running'; result = { ok: true, state: 'queued', cells: [] }; break;
         case 'scan_stop': scanState = 'cancelled'; result = { ok: true, state: 'stopping', cells: [] }; break;
       }
+    } else if (object === 'system' && method === 'info' && sdkTest) {
+      result={uptime:60,load:[0,0,0],memory:{total:100*1024*1024,free:20*1024*1024,...(availableBytes==null?{}:{available:availableBytes})}};
     } else if (object === 'network.interface') {
       result = { interface: [{ interface: 'wan', up: true, proto: 'ql_datacall', device: 'ccmni2', uptime: 120, 'ipv4-address': [{ address: '192.0.2.5' }] }] };
     } else if (object === 'network.device') {
@@ -147,6 +158,60 @@ const server = http.createServer(async (req, res) => {
         ))));
     };
     const count = (method) => calls.filter((entry) => entry.method === method).length;
+    if(process.env.MODEM_CARD_TEST){
+      sdkTest=true;await page.setViewportSize({width:390,height:844});await page.goto(origin+'/rg620/#/system/info');
+      const card=(title)=>page.locator('.page-card').filter({has:page.getByText(title,{exact:true})});
+      const sim=card('SIM 卡'),modem=card('蜂窝模组');
+      await sim.getByText(/•+7890/).waitFor();assert.equal(await page.getByText('12345678901234567890',{exact:true}).count(),0);
+      await sim.getByRole('button',{name:'显示完整号码'}).click();await sim.getByText('12345678901234567890',{exact:true}).waitFor();
+      await sim.getByRole('button',{name:'隐藏号码'}).click();await sim.getByText(/•+7890/).waitFor();
+      await modem.getByText('未读到',{exact:true}).first().waitFor();
+      const tile=label=>page.locator('.metric').filter({has:page.getByText(label,{exact:true})});
+      await tile('内存占用').getByText('40.0 MiB / 100.0 MiB',{exact:true}).waitFor();await verifyNoOverflow();
+      if(process.env.ENGINEERING_ARTIFACTS)await sim.screenshot({path:path.join(process.env.ENGINEERING_ARTIFACTS,'sim-mobile.png')});
+      availableBytes=null;await page.reload();await tile('非空闲内存').getByText('80',{exact:false}).first().waitFor();
+      await visible('含缓存');console.log('PASS: modem/SIM layout, masked identifiers and reveal, missing live reading, available/free memory semantics');return;
+    }
+    if(process.env.LOCK_PROTOCOL_TEST){
+      const settings=origin+'/rg620/#/network/setting',network=origin+'/rg620/#/network/info';
+      const dlg=page.getByRole('dialog'), exact=(n)=>dlg.getByRole('button',{name:n,exact:true});
+      const target=page.getByRole('button',{name:'锁定 NR 636666 PCI 0',exact:true});
+      const last=m=>calls.filter(c=>c.method===m).at(-1)?.params;
+      await page.goto(network);lockOpt=0;await target.click();await exact('锁定主小区').waitFor();
+      assert.equal(await dlg.getByRole('radio',{name:'只锁频点'}).count(),0);
+      assert.equal(await dlg.getByRole('checkbox').count(),0);
+      await exact('锁定主小区').click();await dlg.waitFor({state:'hidden'});
+      assert.deepEqual(last('cell_set'),{rat:'NR',arfcn:'636666',pci:'0',confirm:true});
+      await page.goto(settings);const apply=page.getByRole('checkbox',{name:/立即重新驻留/});
+      await visible('候选小区');assert.equal(await apply.count(),0);
+      lockApi=2;await page.reload();await apply.waitFor();assert(await apply.isChecked());await page.getByText(/^立即重新驻留（射频重启/).click();assert(!(await apply.isChecked()));
+      await page.getByRole('radio',{name:'只锁频点'}).click();
+      await page.locator('.candidate-row').filter({hasText:'636666'}).click();
+      await page.getByRole('button',{name:'锁定频点',exact:true}).click();
+      await page.waitForFunction(()=>document.body.innerText.includes('下次重选'));
+      assert.deepEqual(last('cell_set'),{rat:'NR',arfcn:'636666',kind:'arfcn',apply:false,confirm:true});
+      lockOpt=0;overview.carriers=[carrier,secondary];await page.goto(network);await visible('服务载波');pushNetwork();
+      await page.getByRole('button',{name:'将 NR 636666 / PCI 0 设为主小区',exact:true}).click();await exact('锁定主小区').waitFor();
+      const sent=count('cell_set');await exact('取消').click();assert.equal(count('cell_set'),sent);
+      await page.setViewportSize({width:390,height:844});await page.getByRole('button',{name:'将 NR 636666 / PCI 0 设为主小区',exact:true}).click();await verifyNoOverflow();
+      if(process.env.ENGINEERING_ARTIFACTS)await dlg.screenshot({path:path.join(process.env.ENGINEERING_ARTIFACTS,'protocol-mobile.png')});
+      const ready=page.waitForResponse(r=>r.url()===origin+'/ubus'&&r.request().postDataJSON()?.params?.[2]==='cell_set');
+      await exact('锁定主小区').click();await ready;await dlg.getByText(/正在按新规则重新驻留/).waitFor();
+      overview.carriers=[{...secondary,primary:true,state:2}];pushNetwork();
+      await dlg.waitFor({state:'hidden',timeout:10000});
+      assert.deepEqual(last('cell_set'),{rat:'NR',arfcn:'636666',pci:'0',kind:'cell',apply:true,confirm:true});
+      // A registered PCC outside the submitted list must not be reported as a successful match.
+      lockOpt=0;lockList=null;
+      const second={...neighbor,arfcn:637000,pci:2};
+      overview.cells=[neighbor,second];overview.carriers=[carrier];await page.goto(settings);
+      const candidates=page.locator('.candidate-row');await candidates.filter({hasText:'636666'}).click();await candidates.filter({hasText:'637000'}).click();
+      await page.getByRole('button',{name:/提交白名单（2）/}).click();await visible('正在重新驻留');
+      await visible('已等待 3 秒');assert(!(await page.locator('.status-note').innerText()).includes('名单内'));
+      overview.carriers=[{...secondary,arfcn:second.arfcn,pci:second.pci,primary:true,state:2}];pushNetwork();
+      await visible('实际主小区在提交的白名单内');
+      assert.deepEqual(last('cell_list_set'),{cells:'NR:636666:0,NR:637000:2',apply:true,confirm:true});
+      console.log('PASS: old backend exact-lock payload; mixed install hides v2; frequency-only omits PCI; apply opt-out; SCC action and mobile; actual PCC and whitelist match against fixtures');return;
+    }
     if(process.env.RADIO_STATUS_TEST){
       await page.goto(origin+'/rg620/#/system/info');
       const card=name=>page.locator('.page-card').filter({has:page.getByText(name,{exact:true})});
@@ -208,11 +273,11 @@ const server = http.createServer(async (req, res) => {
       const row=page.getByRole('button',{name:'锁定 NR 636666 PCI 0',exact:true});
       const dlg=page.getByRole('dialog');
       const close=async()=>{await dlg.getByRole('button',{name:'取消',exact:true}).click();await dlg.waitFor({state:'hidden'});};
-      for(const [opt,freq,label] of [[0,0,'确认锁定'],[1,636666,'解除锁定'],[1,175310,'改锁到此小区'],[2,636666,'改锁到此小区'],[null,0,'重新读取']]){
+      for(const [opt,freq,label] of [[0,0,'锁定主小区'],[1,636666,'解除锁定'],[1,175310,'改锁到此小区'],[2,636666,'改锁到此小区'],[null,0,'重新读取']]){
         lockOpt=opt;lockArfcn=freq;
         await row.click();await dlg.getByRole('button',{name:label,exact:true}).waitFor();
-        for(const other of ['确认锁定','改锁到此小区','解除锁定']) if(other!==label)assert.equal(await dlg.getByRole('button',{name:other,exact:true}).count(),0);
-        if(opt===null){lockOpt=0;await dlg.getByRole('button',{name:'重新读取'}).click();await dlg.getByRole('button',{name:'确认锁定'}).waitFor();}
+        for(const other of ['锁定主小区','改锁到此小区','解除锁定']) if(other!==label)assert.equal(await dlg.getByRole('button',{name:other,exact:true}).count(),0);
+        if(opt===null){lockOpt=0;await dlg.getByRole('button',{name:'重新读取'}).click();await dlg.getByRole('button',{name:'锁定主小区'}).waitFor();}
         await close();
       }
       assert.equal(count('cell_set')+count('cell_clear')+count('cell_list_clear'),0);
@@ -223,7 +288,7 @@ const server = http.createServer(async (req, res) => {
       await dlg.getByRole('button',{name:'改锁到此小区'}).click();await dlg.waitFor({state:'hidden'});assert.equal(count('cell_set'),1);
       await row.click();await dlg.getByRole('button',{name:'解除锁定'}).click();await dlg.waitFor({state:'hidden'});
       assert.equal(count('cell_clear'),1);assert.equal(count('cell_list_clear'),0);
-      lockOpt=0;await page.setViewportSize({width:360,height:800});await row.click();await dlg.getByRole('button',{name:'确认锁定'}).waitFor();
+      lockOpt=0;await page.setViewportSize({width:360,height:800});await row.click();await dlg.getByRole('button',{name:'锁定主小区'}).waitFor();
       await verifyNoOverflow();await dlg.screenshot({path:path.join(process.env.ENGINEERING_ARTIFACTS,'lock-mobile.png')});
       console.log('PASS: unlocked, same, other, frequency-only, unreadable/retry, stale state, isolated clear, mobile');return;
     }

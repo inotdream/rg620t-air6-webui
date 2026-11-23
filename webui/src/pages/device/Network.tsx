@@ -501,10 +501,19 @@ const Network: React.FC = () => {
                     <span className="carrier-specs">PCI {item.pci}{item.bw ? ` · ${item.bw} MHz` : ''}</span>
                   </div>
                 </div>
-                <Tag size="small" color={ratTagColor(item.rat)}>{item.rat}</Tag>
+                <span className="service-actions">
+                  {!item.primary && Number.isInteger(item.arfcn) && item.arfcn >= (item.rat === 'LTE' ? 0 : 1) ? (
+                    <Button size="small" aria-label={`将 ${item.rat} ${item.arfcn} / PCI ${item.pci} 设为主小区`} icon={<IconLock size="small" aria-hidden="true" />} onClick={() => setLockTarget(
+                      cells?.find((c) => c.rat === item.rat && c.arfcn === item.arfcn && c.pci === item.pci)
+                        ?? { rat: item.rat, arfcn: item.arfcn, pci: item.pci, cell: '0', tac: 0, rsrp: Number.NaN })}>
+                      设为主小区
+                    </Button>
+                  ) : null}
+                  <Tag size="small" color={ratTagColor(item.rat)}>{item.rat}</Tag>
+                </span>
               </div>
               <Kv dense columns={2} items={[
-                { label: '频点 ARFCN', value: item.arfcn || '—' },
+                { label: '频点 ARFCN', value: item.arfcn || (item.rat === 'LTE' && item.arfcn === 0 ? 0 : '—') },
                 { label: '载波状态', value: item.primary ? '主载波' : item.state === 2 ? '已激活' : item.state === 1 ? '未激活' : '未上报' },
                 { label: '下行层数 / 调制', value: metrics(item.dl) },
                 { label: '上行层数 / 调制', value: metrics(item.ul) },

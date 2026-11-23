@@ -6,10 +6,22 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <signal.h>
+#include <sys/uio.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+#include "ql_dm.h"
 #include "ql_nw.h"
 #include "ql_sms.h"
 #include "ql_sim.h"
 #include "sms-submit.h"
+
+/* Last locally accepted list this boot, never a modem readback. The modem flock also serializes this journal. */
+#define CELL_LIST_RECORD "/var/lock/dlink-cell-list.last"
+#define CELL_LIST_MAX 2048
+#define VOICE_HELPER "/usr/libexec/dlink-cellular-voice"
+static int modem_fd = -1;
 
 #define COUNT(a) (sizeof(a) / sizeof((a)[0]))
 static void fail(const char *error, int code)
@@ -216,17 +228,110 @@ static void band_state(int option)
 	bands(info.nr_band_class,COUNT(info.nr_band_class));
 	putchar('}');
 }
+static const char *list_request(char *spec, ql_nw_set_cell_arfcn_list_lock_req_t *request, char *order);
+static int read_record(int fd, char spec[CELL_LIST_MAX+2])
+{
+	ssize_t n=pread(fd,spec,CELL_LIST_MAX+2,0);
+	if (n<2 || n>CELL_LIST_MAX+1 || spec[n-1]!='\n' || memchr(spec,0,(size_t)n)) return 0;
+	spec[n-1]=0;
+	return 1;
+}
+static void list_record(void)
+{
+	char spec[CELL_LIST_MAX+2];
+	/* An unwritable old record could not be invalidated by a later accepted mutation. */
+	int fd=open(CELL_LIST_RECORD,O_RDWR|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW);
+	int valid=fd>=0 && read_record(fd,spec);
+	if (fd>=0) close(fd);
+	ql_nw_set_cell_arfcn_list_lock_req_t list={0};
+	char order[COUNT(list.lte_cell_list)+COUNT(list.nr_cell_list)];
+	if (!valid || list_request(spec,&list,order)) { fputs("null",stdout); return; }
+	putchar('[');
+	unsigned lte=0,nr=0;
+	for (int i=0;i<list.lte_cell_count+list.nr_cell_count;i++) {
+		uint32_t freq,pci;
+		if (order[i]) { freq=list.nr_cell_list[nr].nr_arfcn; pci=list.nr_cell_list[nr++].pci; }
+		else { freq=list.lte_cell_list[lte].earfcn; pci=list.lte_cell_list[lte++].pci; }
+		printf("%s{\"rat\":\"%s\",\"arfcn\":%"PRIu32",\"pci\":%"PRIu32"}",i?",":"",
+		       order[i]?"NR":"LTE",freq,pci);
+	}
+	putchar(']');
+}
 static void locks(void)
 {
 	ql_nw_get_cell_arfcn_lock_resp_t info={0};
 	int rc=ql_nw_get_cell_arfcn_lock(&info);
-	printf("{\"ok\":true,\"cell\":");
+	const char *v2=getenv("DLINK_LOCK_RPC_V2");
+	printf("{\"ok\":true,%s\"cell\":",v2 && !strcmp(v2,"1") ? "\"lock_api\":2," : "");
 	if (rc) printf("null");
 	else printf("{\"opt\":%u,\"rat\":\"%s\",\"arfcn\":%" PRIu32 ",\"pci\":%" PRIu32 ",\"mode\":%u}",
 		info.opt,info.act==11?"NR":info.act==7?"LTE":info.act==2?"UMTS":"",info.arfcn,info.pci,info.lock_mode);
+	printf(",\"list\":"); list_record();
 	printf(",\"current\":"); band_state(0);
 	printf(",\"supported\":"); band_state(1);
 	printf("}\n");
+}
+/* The private voice check borrows our modem flock; a local dial cannot race it. */
+static const char *voice_idle(void)
+{
+	pid_t child=fork();
+	if (child<0) return "apply_voice_unknown";
+	if (!child) {
+		int null=open("/dev/null",O_WRONLY);
+		if (null<0 || dup2(null,STDOUT_FILENO)<0 || dup2(modem_fd,9)<0 || fcntl(9,F_SETFD,0)<0) _exit(2);
+		execl(VOICE_HELPER,VOICE_HELPER,"reselect-idle",(char *)NULL);
+		_exit(2);
+	}
+	int status;
+	while (waitpid(child,&status,0)<0) if (errno!=EINTR) return "apply_voice_unknown";
+	if (!WIFEXITED(status)) return "apply_voice_unknown";
+	return WEXITSTATUS(status)==10 ? NULL : WEXITSTATUS(status)==11 ? "apply_call" : "apply_voice_unknown";
+}
+static int airplane_state(void)
+{
+	QL_DM_AIR_PLANE_MODE_TYPE_E mode=QL_DM_AIR_PLANE_MODE_UNKNOWN;
+	if (ql_dm_get_air_plane_mode(&mode)) return -1;
+	return mode==QL_DM_AIR_PLANE_MODE_ON ? 1 : mode==QL_DM_AIR_PLANE_MODE_OFF ? 0 : -1;
+}
+static int settle(int want)
+{
+	struct timespec start,now;
+	if (clock_gettime(CLOCK_MONOTONIC,&start)) return airplane_state();
+	for (;;) {
+		int seen=airplane_state();
+		if (seen==want || clock_gettime(CLOCK_MONOTONIC,&now) || now.tv_sec-start.tv_sec>3 ||
+		    (now.tv_sec-start.tv_sec==3 && now.tv_nsec>=start.tv_nsec)) return seen;
+		usleep(250000);
+	}
+}
+static const char *reselect(void)
+{
+	const char *problem=NULL;
+	if (ql_dm_init(DM_IPC_MODE_DEFAULT)) return "apply_init";
+	int state=airplane_state();
+	if (state!=0) problem=state==1 ? "apply_airplane" : "apply_read";
+	else problem=voice_idle();
+	if (!problem) {
+		/* Even an errored SET can have taken effect: always read the final radio state. */
+		int rc=ql_dm_set_air_plane_mode(QL_DM_AIR_PLANE_MODE_ON);
+		if ((rc ? airplane_state() : settle(1))!=1) problem="apply_radio";
+		for (int i=0;i<3;i++) {
+			rc=ql_dm_set_air_plane_mode(QL_DM_AIR_PLANE_MODE_OFF);
+			state=rc ? airplane_state() : settle(0);
+			if (state==0) break;
+		}
+		if (state!=0) problem=state==1 ? "radio_off" : "radio_unknown";
+	}
+	ql_dm_release();
+	return problem;
+}
+static void done(int apply, int recorded)
+{
+	const char *problem=apply ? reselect() : NULL;
+	printf("{\"ok\":true,\"applied\":%s",apply && !problem ? "true" : "false");
+	if (recorded>=0) printf(",\"verified\":false,\"recorded\":%s",recorded ? "true" : "false");
+	if (problem) printf(",\"apply_error\":\"%s\"",problem);
+	puts("}");
 }
 static int uint_arg(const char *s, unsigned long max, uint32_t *out)
 {
@@ -281,74 +386,111 @@ static void band_set(const char *rat_arg, const char *list)
 	}
 	puts("{\"ok\":true}");
 }
+static int same_lock(const ql_nw_set_cell_arfcn_lock_req_t *want, const ql_nw_get_cell_arfcn_lock_resp_t *got)
+{
+	if (!want->opt) return got->opt==0;
+	/* A frequency lock (opt 2) has no PCI to compare. */
+	return got->opt==want->opt && got->act==want->act && got->arfcn==want->arfcn &&
+		got->lock_mode==want->lock_mode && (want->opt==2 || got->pci==want->pci);
+}
+/* cell_set clear [apply] | cell_set RAT ARFCN PCI|any [apply] */
 static void cell_set(int argc,char **argv)
 {
 	ql_nw_set_cell_arfcn_lock_req_t desired={0};
 	ql_nw_get_cell_arfcn_lock_resp_t actual={0};
-	int clear=argc==3 && !strcmp(argv[2],"clear");
+	int clear=!strcmp(argv[2],"clear");
+	int args=clear ? 3 : 5;
+	int apply=argc==args+1 && !strcmp(argv[args],"apply");
+	if (argc!=args && !apply) { fail("input",0); return; }
 	if (!clear) {
-		if (argc!=5 || (strcmp(argv[2],"LTE") && strcmp(argv[2],"NR"))) { fail("input",0); return; }
-		int nr=!strcmp(argv[2],"NR");
-		desired.act=nr?11:7; desired.opt=1; desired.lock_mode=3;
-		if (!uint_arg(argv[3],nr?3279165:262143,&desired.arfcn) ||
-		    !uint_arg(argv[4],nr?1007:503,&desired.pci)) { fail("input",0); return; }
+		if (strcmp(argv[2],"LTE") && strcmp(argv[2],"NR")) { fail("input",0); return; }
+		int nr=!strcmp(argv[2],"NR"), any=!strcmp(argv[4],"any");
+		desired.act=nr?11:7; desired.opt=any?2:1; desired.lock_mode=3;
+		if (!uint_arg(argv[3],nr?3279165:262143,&desired.arfcn) || (any && !desired.arfcn) ||
+		    (!any && !uint_arg(argv[4],nr?1007:503,&desired.pci))) { fail("input",0); return; }
 	}
 	int rc=ql_nw_get_cell_arfcn_lock(&actual);
 	if (rc) { fail("cell_read",rc); return; }
-	if ((clear && actual.opt==0) || (!clear && desired.opt==actual.opt && desired.act==actual.act &&
-	    desired.arfcn==actual.arfcn && desired.pci==actual.pci && desired.lock_mode==actual.lock_mode)) {
-		puts("{\"ok\":true}"); return;
+	if (!same_lock(&desired,&actual)) {
+		if ((rc=ql_nw_set_cell_arfcn_lock(&desired))!=0) { fail("cell_write",rc); return; }
+		if ((rc=ql_nw_get_cell_arfcn_lock(&actual))!=0 || !same_lock(&desired,&actual)) { fail("readback",rc); return; }
 	}
-	if ((rc=ql_nw_set_cell_arfcn_lock(&desired))!=0) { fail("cell_write",rc); return; }
-	if ((rc=ql_nw_get_cell_arfcn_lock(&actual))!=0 || (clear ? actual.opt!=0 :
-	    (actual.opt!=desired.opt || actual.act!=desired.act || actual.arfcn!=desired.arfcn ||
-	     actual.pci!=desired.pci || actual.lock_mode!=desired.lock_mode))) {
-		fail("readback",rc); return;
-	}
-	puts("{\"ok\":true}");
+	/* Re-applying an unchanged lock still re-selects: that is how a pending lock is made effective. */
+	done(apply,-1);
 }
-/* The vendor exposes set/cancel for the whitelist, but no whitelist getter. */
-static void cell_list(char *spec)
+/* Mark the record unknown before sending a write. A killed process leaves no stale list. */
+static int begin_record(char previous[CELL_LIST_MAX+2])
+{
+	int fd=open(CELL_LIST_RECORD,O_RDWR|O_CREAT|O_NONBLOCK|O_CLOEXEC|O_NOFOLLOW,0600);
+	if (fd>=0) {
+		if (!read_record(fd,previous)) previous[0]=0;
+		if (!ftruncate(fd,0)) return fd;
+		close(fd);
+	}
+	unlink(CELL_LIST_RECORD);
+	return -1;
+}
+static int finish_record(int fd, const char *spec)
+{
+	if (fd<0) return 0;
+	size_t n=strlen(spec);
+	struct iovec parts[]={{(void *)spec,n},{(void *)"\n",1}};
+	int saved=n && writev(fd,parts,2)==(ssize_t)(n+1);
+	if (close(fd)) saved=0;
+	if (!saved) unlink(CELL_LIST_RECORD);
+	return saved;
+}
+static const char *list_request(char *spec, ql_nw_set_cell_arfcn_list_lock_req_t *request, char *order)
+{
+	if (!strcmp(spec,"clear")) return NULL;
+	request->opt=1;
+	char *row;
+	while ((row=strsep(&spec,","))) {
+		char *system=strsep(&row,":");
+		char *freq=strsep(&row,":");
+		char *phys=strsep(&row,":");
+		int nr=!strcmp(system,"NR");
+		uint32_t arfcn,pci;
+		if ((!nr && strcmp(system,"LTE")) || row || !uint_arg(freq,nr?3279165:262143,&arfcn) ||
+		    !uint_arg(phys,nr?1007:503,&pci)) return "input";
+		if (nr) {
+			if (request->nr_cell_count>=COUNT(request->nr_cell_list)) return "input";
+			if (order) order[request->nr_cell_count+request->lte_cell_count]=1;
+			for (unsigned i=0;i<request->nr_cell_count;i++)
+				if (request->nr_cell_list[i].nr_arfcn==arfcn && request->nr_cell_list[i].pci==pci) return "cell_duplicate";
+			request->nr_cell_list[request->nr_cell_count++]=(nr_cell_lock_info){.nr_arfcn=arfcn,.pci=pci,.freq_band=0};
+		} else {
+			if (request->lte_cell_count>=COUNT(request->lte_cell_list)) return "input";
+			if (order) order[request->nr_cell_count+request->lte_cell_count]=0;
+			for (unsigned i=0;i<request->lte_cell_count;i++)
+				if (request->lte_cell_list[i].earfcn==arfcn && request->lte_cell_list[i].pci==pci) return "cell_duplicate";
+			request->lte_cell_list[request->lte_cell_count++]=(lte_cell_lock_info){.earfcn=arfcn,.pci=pci};
+		}
+	}
+	return request->lte_cell_count+request->nr_cell_count>=2 ? NULL : "cell_min";
+}
+static void cell_list(char *spec, int apply)
 {
 	ql_nw_set_cell_arfcn_list_lock_req_t request={0};
-	if (strcmp(spec,"clear")) {
-		if (strlen(spec)>2048) { fail("input",0); return; }
-		request.opt=1;
-		char *row;
-		while ((row=strsep(&spec,","))) {
-			char *system=strsep(&row,":");
-			char *freq=strsep(&row,":");
-			char *phys=strsep(&row,":");
-			int nr=!strcmp(system,"NR");
-			uint32_t arfcn,pci;
-			if ((!nr && strcmp(system,"LTE")) || row ||
-			    !uint_arg(freq,nr?3279165:262143,&arfcn) || !uint_arg(phys,nr?1007:503,&pci)) {
-				fail("input",0); return;
-			}
-			if (nr) {
-				if (request.nr_cell_count>=COUNT(request.nr_cell_list)) { fail("input",0); return; }
-				for (unsigned i=0;i<request.nr_cell_count;i++)
-					if (request.nr_cell_list[i].nr_arfcn==arfcn && request.nr_cell_list[i].pci==pci) {
-						fail("cell_duplicate",0); return;
-					}
-				request.nr_cell_list[request.nr_cell_count++]=(nr_cell_lock_info){.nr_arfcn=arfcn,.pci=pci,.freq_band=0};
-			} else {
-				if (request.lte_cell_count>=COUNT(request.lte_cell_list)) { fail("input",0); return; }
-				for (unsigned i=0;i<request.lte_cell_count;i++)
-					if (request.lte_cell_list[i].earfcn==arfcn && request.lte_cell_list[i].pci==pci) {
-						fail("cell_duplicate",0); return;
-					}
-				request.lte_cell_list[request.lte_cell_count++]=(lte_cell_lock_info){.earfcn=arfcn,.pci=pci};
-			}
-		}
-		if (request.lte_cell_count+request.nr_cell_count<2) { fail("cell_min",0); return; }
+	char accepted[CELL_LIST_MAX+1],previous[CELL_LIST_MAX+2]="";
+	if (strlen(spec)>CELL_LIST_MAX) { fail("input",0); return; }
+	strcpy(accepted,spec);
+	const char *problem=list_request(spec,&request,NULL);
+	if (problem) { fail(problem,0); return; }
+	if (request.opt) {
 		ql_nw_get_cell_arfcn_lock_resp_t single={0};
 		int rc=ql_nw_get_cell_arfcn_lock(&single);
 		if (rc) { fail("cell_read",rc); return; }
 		if (single.opt) { fail("single_lock",0); return; }
 	}
-	const int rc=ql_nw_set_cell_arfcn_list_lock(&request);
-	if (rc) fail("cell_list_write",rc); else puts("{\"ok\":true,\"verified\":false}");
+	int fd=begin_record(previous);
+	int rc=ql_nw_set_cell_arfcn_list_lock(&request);
+	if (rc) {
+		finish_record(fd,previous);
+		fail("cell_list_write",rc);
+		return;
+	}
+	done(apply,finish_record(fd,accepted));
 }
 static void inbox(void)
 {
@@ -453,12 +595,46 @@ static void sim_status(void)
 	}
 	ql_sim_release();
 }
+/* Fork before the SDK starts its IPC threads. A timed-out RPC or a disconnected client
+ * can kill the waiter, not the session which owns the modem lock and restores radio power. */
+static int wait_for_lock_worker(void)
+{
+	int channel[2];
+	if (pipe(channel)) { fail("busy",errno); return 1; }
+	pid_t worker=fork();
+	if (worker<0) { close(channel[0]); close(channel[1]); fail("busy",errno); return 1; }
+	if (!worker) {
+		close(channel[0]);
+		if (setsid()<0 || dup2(channel[1],STDOUT_FILENO)<0) _exit(1);
+		close(channel[1]);
+		signal(SIGPIPE,SIG_IGN);
+		return 0;
+	}
+	close(channel[1]);
+	char reply[512];
+	size_t used=0;
+	while (used<sizeof reply-1) {
+		ssize_t n=read(channel[0],reply+used,sizeof reply-1-used);
+		if (n<0 && errno==EINTR) continue;
+		if (n<=0) break;
+		used+=(size_t)n;
+	}
+	close(channel[0]);
+	int status;
+	while (waitpid(worker,&status,0)<0 && errno==EINTR) {}
+	if (!used || reply[used-1]!='\n') fail("timeout",0);
+	else fwrite(reply,1,used,stdout);
+	return 1;
+}
 int main(int argc,char **argv)
 {
 	if (argc<2) { fail("input",0); return 0; }
 	const char *action=argv[1];
-	int fd=open("/var/lock/dlink-cellular.lock",O_CREAT|O_CLOEXEC|O_NOFOLLOW|O_WRONLY,0600);
-	if (fd<0 || flock(fd,LOCK_EX|LOCK_NB)) { fail("busy",0); return 0; }
+	int apply=(!strcmp(action,"cell_set") && (argc==6 || (argc==4 && !strcmp(argv[2],"clear")))) ||
+	          (!strcmp(action,"cell_list") && argc==4);
+	if (apply && !strcmp(argv[argc-1],"apply") && wait_for_lock_worker()) return 0;
+	modem_fd=open("/var/lock/dlink-cellular.lock",O_CREAT|O_CLOEXEC|O_NOFOLLOW|O_WRONLY,0600);
+	if (modem_fd<0 || flock(modem_fd,LOCK_EX|LOCK_NB)) { fail("busy",0); return 0; }
 	if (!strcmp(action,"sim_status") && argc==2) { sim_status(); return 0; }
 	int sms=!strncmp(action,"sms_",4);
 	int rc=sms ? ql_sms_init(SMS_IPC_MODE_DEFAULT) : ql_nw_init(NW_IPC_MODE_DEFAULT);
@@ -469,8 +645,8 @@ int main(int argc,char **argv)
 	else if (!strcmp(action,"mimo_info") && argc==2) mimo_info();
 	else if (!strcmp(action,"mimo_set") && argc==4) mimo_set(argv[2],argv[3]);
 	else if (!strcmp(action,"band_set") && argc==4) band_set(argv[2],argv[3]);
-	else if (!strcmp(action,"cell_set")) cell_set(argc,argv);
-	else if (!strcmp(action,"cell_list") && argc==3) cell_list(argv[2]);
+	else if (!strcmp(action,"cell_set") && argc>=3) cell_set(argc,argv);
+	else if (!strcmp(action,"cell_list") && (argc==3 || (argc==4 && !strcmp(argv[3],"apply")))) cell_list(argv[2],argc==4);
 	else if (!strcmp(action,"sms_list") && argc==2) inbox();
 	else if (!strcmp(action,"sms_read") && argc==3) read_sms(argv[2]);
 	else if (!strcmp(action,"sms_send") && argc==2) send_sms();
